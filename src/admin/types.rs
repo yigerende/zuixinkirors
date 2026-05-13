@@ -359,11 +359,6 @@ pub struct StartSocialLoginRequest {
     /// Kiro auth endpoint（留空用默认）
     #[serde(default)]
     pub auth_endpoint: Option<String>,
-    /// 前端所在服务器的公网基础 URL（如 https://kiro-code.ai80.vip）
-    /// 提供时启用远程回调模式，redirect_uri 指向 {callback_base_url}/api/admin/auth/social/callback
-    /// 不提供时回退到本地 TCP 回调服务器模式（浏览器与服务端须同机）
-    #[serde(default)]
-    pub callback_base_url: Option<String>,
 }
 
 /// 发起 Social 登录响应
@@ -380,6 +375,26 @@ pub struct StartSocialLoginResponse {
 
 /// 轮询 Social 登录状态（与 IdC 共用状态枚举）
 pub type PollSocialLoginResponse = PollIdcLoginResponse;
+
+/// 手动完成 Social 登录请求（远程访问场景：从浏览器地址栏复制回调 URL）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteSocialLoginRequest {
+    /// OAuth 授权码（从回调 URL 的 code 参数提取）
+    pub code: String,
+    /// OAuth state（从回调 URL 的 state 参数提取，用于 CSRF 校验）
+    pub state: String,
+    /// 登录选项（从回调 URL 的 login_option 参数提取，可为空）
+    #[serde(default)]
+    pub login_option: String,
+    /// 回调 URL 的路径（如 /oauth/callback）
+    #[serde(default = "default_oauth_path")]
+    pub path: String,
+}
+
+fn default_oauth_path() -> String {
+    "/oauth/callback".to_string()
+}
 
 // ============ 通用响应 ============
 

@@ -184,8 +184,14 @@ export interface StartSocialLoginRequest {
   email?: string
   proxyUrl?: string
   authEndpoint?: string
-  /** 前端所在服务器的公网基础 URL；提供时使用服务端公开回调路由，无需浏览器与服务端同机 */
-  callbackBaseUrl?: string
+}
+
+/** 远程访问时手动完成 Social 登录：从浏览器地址栏粘贴的回调 URL 中提取参数 */
+export interface CompleteSocialLoginRequest {
+  code: string
+  state: string
+  loginOption?: string
+  path?: string
 }
 
 export interface StartSocialLoginResponse {

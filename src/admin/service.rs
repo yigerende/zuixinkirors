@@ -66,13 +66,10 @@ struct SocialAuthSession {
     expires_at: DateTime<Utc>,
     /// 收到 OAuth 回调时的数据（code + login_option + path）
     callback_rx: tokio::sync::Mutex<tokio::sync::oneshot::Receiver<social::OAuthCallbackData>>,
-    /// 远程回调模式：axum handler 调用 handle_oauth_callback 时通过此 sender 注入数据
-    /// 本地模式（local callback server）时为 None
-    callback_tx: Option<tokio::sync::oneshot::Sender<social::OAuthCallbackData>>,
     cred_template: KiroCredentials,
     proxy: Option<ProxyConfig>,
-    /// Drop 时自动关闭回调服务器并释放端口（远程模式时为 None）
-    _server_handle: Option<social::ServerHandle>,
+    /// Drop 时自动关闭回调服务器并释放端口
+    _server_handle: social::ServerHandle,
 }
 
 /// IdC 设备授权会话状态
@@ -773,22 +770,12 @@ impl AdminService {
 
         let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
 
-        // 根据是否提供 callback_base_url 选择本地或远程回调模式
-        let (redirect_uri, server_handle, callback_tx) =
-            if let Some(ref base_url) = req.callback_base_url {
-                // 远程模式：用服务端公网地址接收 OAuth 回调
-                let uri = format!(
-                    "{}/api/admin/auth/social/callback",
-                    base_url.trim_end_matches('/')
-                );
-                (uri, None, Some(tx))
-            } else {
-                // 本地模式：启动临时 TCP 服务器（浏览器与服务端须在同一台机器）
-                let (port, handle) = social::start_callback_server(tx)
-                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-                (format!("http://127.0.0.1:{}", port), Some(handle), None)
-            };
+        // 启动本地 TCP 回调服务器（本地模式）
+        // 远程访问时用户须从浏览器地址栏复制回调 URL，通过 complete_social_login 接口手动完成
+        let (port, server_handle) = social::start_callback_server(tx)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
+        let redirect_uri = format!("http://127.0.0.1:{}", port);
         let portal_url = social::build_portal_url(&state, &code_challenge, &redirect_uri);
 
         let expires_at = Utc::now() + Duration::minutes(10);
@@ -809,7 +796,6 @@ impl AdminService {
             redirect_uri,
             expires_at,
             callback_rx: tokio::sync::Mutex::new(rx),
-            callback_tx,
             cred_template,
             proxy,
             _server_handle: server_handle,
@@ -874,100 +860,110 @@ impl AdminService {
                 ));
             }
             PollOutcome::Received(callback) => {
-                // 取出 session（含 code_verifier、state 等敏感数据）
-                let session = {
-                    let mut sessions = self.social_sessions.lock();
-                    sessions.remove(session_id)
-                };
-                let session = match session {
-                    Some(s) => s,
-                    None => return Err(AdminServiceError::NotFound { id: 0 }),
-                };
-
-                // CSRF 验证：回调 state 必须与发起时一致
-                if callback.state != session.state {
-                    tracing::warn!(
-                        "Social 登录 state 不匹配（期望 {}, 收到 {}），已拒绝",
-                        session.state, callback.state
-                    );
-                    return Err(AdminServiceError::InternalError(
-                        "OAuth state 不匹配，请重新发起登录".to_string(),
-                    ));
-                }
-
-                let config = self.token_manager.config();
-
-                // 构建完整的 redirect_uri（与 IDE 行为一致）
-                let full_redirect_uri = if callback.login_option.is_empty() {
-                    format!("{}{}", session.redirect_uri, callback.path)
-                } else {
-                    format!(
-                        "{}{}?login_option={}",
-                        session.redirect_uri,
-                        callback.path,
-                        urlencoding::encode(&callback.login_option),
-                    )
-                };
-
-                let token = social::exchange_code_for_token(
-                    &session.auth_endpoint,
-                    &callback.code,
-                    &session.code_verifier,
-                    &full_redirect_uri,
-                    config,
-                    session.proxy.as_ref(),
-                )
-                .await
-                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-
-                let mut new_cred = session.cred_template;
-                new_cred.access_token = Some(token.access_token);
-                new_cred.refresh_token = token.refresh_token;
-                new_cred.expires_at = token.expires_at.or_else(|| {
-                    token.expires_in.map(|secs| {
-                        (Utc::now() + Duration::seconds(secs)).to_rfc3339()
-                    })
-                });
-                if let Some(arn) = token.profile_arn {
-                    new_cred.profile_arn = Some(arn);
-                }
-
-                let credential_id = self
-                    .token_manager
-                    .add_credential(new_cred)
-                    .await
-                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-
-                tracing::info!("Social 登录成功，已添加凭据 #{}", credential_id);
-                Ok(PollIdcLoginResponse::Success { credential_id })
+                self.do_complete_social_login(session_id, callback).await
             }
         }
     }
 
-    /// 接收来自 axum 公开回调路由的 OAuth 数据，注入到等待中的 Social 登录会话
+    /// 内部：完成 Social 登录的 token 兑换和凭据创建（供轮询回调和手动完成共用）
     ///
-    /// 仅用于远程模式（callback_base_url 不为空时）。通过 state 参数定位会话并唤醒轮询。
-    pub fn handle_oauth_callback(
+    /// 调用前须确认 session 存在且未过期。会在内部做 state CSRF 校验。
+    async fn do_complete_social_login(
         &self,
-        state_param: &str,
-        data: social::OAuthCallbackData,
-    ) -> Result<(), AdminServiceError> {
-        let mut sessions = self.social_sessions.lock();
-        let session = sessions
-            .iter_mut()
-            .find(|(_, s)| s.state == state_param)
-            .map(|(_, s)| s)
+        session_id: &str,
+        callback: social::OAuthCallbackData,
+    ) -> Result<PollIdcLoginResponse, AdminServiceError> {
+        // 先做 CSRF 校验（不移除 session，校验失败时保持 session 可继续轮询）
+        {
+            let sessions = self.social_sessions.lock();
+            let s = sessions
+                .get(session_id)
+                .ok_or(AdminServiceError::NotFound { id: 0 })?;
+            if callback.state != s.state {
+                tracing::warn!(
+                    "Social 登录 state 不匹配（期望 {}, 收到 {}），已拒绝",
+                    s.state, callback.state
+                );
+                return Err(AdminServiceError::InternalError(
+                    "OAuth state 不匹配，请重新发起登录".to_string(),
+                ));
+            }
+        }
+
+        // 移除 session（含 code_verifier 等敏感数据）
+        let session = self
+            .social_sessions
+            .lock()
+            .remove(session_id)
             .ok_or(AdminServiceError::NotFound { id: 0 })?;
 
-        let tx = session.callback_tx.take().ok_or_else(|| {
-            AdminServiceError::InvalidCredential(
-                "该会话使用本地回调服务器，不支持远程回调接口".to_string(),
-            )
-        })?;
+        let config = self.token_manager.config();
 
-        tx.send(data).map_err(|_| {
-            AdminServiceError::InternalError("会话回调通道已关闭，请重新发起登录".to_string())
-        })
+        // 构建完整的 redirect_uri（与 IDE 行为一致）
+        let full_redirect_uri = if callback.login_option.is_empty() {
+            format!("{}{}", session.redirect_uri, callback.path)
+        } else {
+            format!(
+                "{}{}?login_option={}",
+                session.redirect_uri,
+                callback.path,
+                urlencoding::encode(&callback.login_option),
+            )
+        };
+
+        let token = social::exchange_code_for_token(
+            &session.auth_endpoint,
+            &callback.code,
+            &session.code_verifier,
+            &full_redirect_uri,
+            config,
+            session.proxy.as_ref(),
+        )
+        .await
+        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let mut new_cred = session.cred_template;
+        new_cred.access_token = Some(token.access_token);
+        new_cred.refresh_token = token.refresh_token;
+        new_cred.expires_at = token.expires_at.or_else(|| {
+            token.expires_in.map(|secs| (Utc::now() + Duration::seconds(secs)).to_rfc3339())
+        });
+        if let Some(arn) = token.profile_arn {
+            new_cred.profile_arn = Some(arn);
+        }
+
+        let credential_id = self
+            .token_manager
+            .add_credential(new_cred)
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        tracing::info!("Social 登录成功，已添加凭据 #{}", credential_id);
+        Ok(PollIdcLoginResponse::Success { credential_id })
+    }
+
+    /// 手动完成 Social 登录：远程访问时从浏览器地址栏粘贴的回调 URL 中提取参数，直接完成 token 兑换
+    pub async fn complete_social_login(
+        &self,
+        session_id: &str,
+        code: String,
+        state: String,
+        login_option: String,
+        path: String,
+    ) -> Result<PollIdcLoginResponse, AdminServiceError> {
+        // 过期检查
+        {
+            let sessions = self.social_sessions.lock();
+            let s = sessions
+                .get(session_id)
+                .ok_or(AdminServiceError::NotFound { id: 0 })?;
+            if Utc::now() >= s.expires_at {
+                return Ok(PollIdcLoginResponse::Expired);
+            }
+        }
+
+        let callback = social::OAuthCallbackData { code, login_option, path, state };
+        self.do_complete_social_login(session_id, callback).await
     }
 
     /// 分类删除凭据错误

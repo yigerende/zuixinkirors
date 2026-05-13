@@ -22,6 +22,7 @@ import type {
   StartSocialLoginRequest,
   StartSocialLoginResponse,
   PollSocialLoginResponse,
+  CompleteSocialLoginRequest,
   GlobalProxyResponse,
   SetGlobalProxyRequest,
   UpdateAdminKeyRequest,
@@ -224,5 +225,14 @@ export async function startSocialLogin(
 // 轮询 Social 登录状态
 export async function pollSocialLogin(sessionId: string): Promise<PollSocialLoginResponse> {
   const { data } = await api.post<PollSocialLoginResponse>(`/auth/social/poll/${sessionId}`)
+  return data
+}
+
+// 手动完成 Social 登录（远程访问时粘贴回调 URL）
+export async function completeSocialLogin(
+  sessionId: string,
+  req: CompleteSocialLoginRequest
+): Promise<PollSocialLoginResponse> {
+  const { data } = await api.post<PollSocialLoginResponse>(`/auth/social/complete/${sessionId}`, req)
   return data
 }

@@ -2,17 +2,18 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
-    response::{Html, IntoResponse},
+    extract::{Path, State},
+    response::IntoResponse,
 };
 
 use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, BatchAddProxyRequest,
-        GlobalProxyResponse, SetDisabledRequest, SetGlobalProxyRequest, SetLoadBalancingModeRequest,
-        SetPriorityRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
-        UpdateAdminKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        CompleteSocialLoginRequest, GlobalProxyResponse, SetDisabledRequest, SetGlobalProxyRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, StartIdcLoginRequest,
+        StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest, UpdateCredentialRequest,
+        UpdateRefreshTokenRequest,
     },
 };
 
@@ -299,62 +300,31 @@ pub async fn poll_social_login(
     }
 }
 
-/// GET /api/admin/auth/social/callback  （无需认证 —— 由 OAuth 提供商重定向过来）
+/// POST /api/admin/auth/social/complete/:session_id
 ///
-/// 接收 Google / GitHub 的 OAuth 授权码，注入到对应的 Social 登录会话中。
-/// 此路由须在 admin_auth_middleware 之外注册。
-#[derive(serde::Deserialize)]
-pub struct OAuthCallbackQuery {
-    pub code: Option<String>,
-    pub state: Option<String>,
-    pub login_option: Option<String>,
-    pub error: Option<String>,
-}
-
-pub async fn oauth_callback(
+/// 远程访问场景下手动完成 Social 登录：
+/// 用户从浏览器地址栏复制 OAuth 回调 URL，前端提取 code/state/login_option 后调用此接口。
+pub async fn complete_social_login(
     State(state): State<AdminState>,
-    Query(params): Query<OAuthCallbackQuery>,
-    uri: axum::http::Uri,
+    Path(session_id): Path<String>,
+    Json(payload): Json<CompleteSocialLoginRequest>,
 ) -> impl IntoResponse {
-    use axum::http::StatusCode;
-
-    // OAuth 授权被用户拒绝
-    if let Some(ref err) = params.error {
-        return Html(format!(
-            "<html><body><script>window.close()</script>\
-             <p style='font-family:sans-serif'>登录失败：{err}</p></body></html>"
-        ))
-        .into_response();
-    }
-
-    let (code, state_param) = match (params.code, params.state) {
-        (Some(c), Some(s)) => (c, s),
-        _ => {
-            return (StatusCode::BAD_REQUEST, "缺少 code 或 state 参数").into_response();
-        }
-    };
-
-    let callback_data = crate::kiro::auth::social::OAuthCallbackData {
-        code,
-        login_option: params.login_option.unwrap_or_default(),
-        path: uri.path().to_string(),
-        state: state_param.clone(),
-    };
-
-    match state.service.handle_oauth_callback(&state_param, callback_data) {
-        Ok(_) => Html(
-            "<html><body><script>window.close()</script>\
-             <p style='font-family:sans-serif;padding:2em'>✅ 登录成功，此窗口将自动关闭。\
-             如未关闭请手动返回管理页面。</p></body></html>",
+    match state
+        .service
+        .complete_social_login(
+            &session_id,
+            payload.code,
+            payload.state,
+            payload.login_option,
+            payload.path,
         )
-        .into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            format!("回调处理失败（state 不匹配或会话已过期）: {}", e),
-        )
-            .into_response(),
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
+
 
 /// GET /api/admin/config/global-proxy
 /// 获取当前全局代理配置
