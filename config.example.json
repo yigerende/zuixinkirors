@@ -6,7 +6,6 @@
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
   "defaultEndpoint": "ide",
-  "updateImage": "zyphrzero/kiro-rs:latest",
   "updateAutoApply": false,
   "updateAutoApplyTime": "03:00",
   "redisUrl": "redis://redis:6379",

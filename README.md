@@ -43,6 +43,8 @@
 - **WebSearch**: 内置 WebSearch 工具转换逻辑
 - **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
 - **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
+- **客户端 Key 分发**（v0.4.0+）：在 Admin 面板生成多把 `csk_*` 客户端 Key 分发给下游用户/项目，每把 Key 独立启用/禁用与计数，泄露不影响其他用户
+- **用量统计与仪表盘**（v0.4.0+）：按请求记录 token 消耗（按日滚动 JSONL），仪表盘展示时间趋势、模型分布、上游凭据贡献
 - **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
 - **凭据级代理**: 支持为每个凭据单独配置 HTTP/SOCKS5 代理，优先级：凭据代理 > 全局代理 > 无代理
 
@@ -54,6 +56,13 @@
   - [3. 启动](#3-启动)
   - [4. 验证](#4-验证)
   - [Docker](#docker)
+    - [一、最小部署](#一最小部署)
+    - [二、首次启动获取密钥](#二首次启动获取密钥)
+    - [三、访问管理面板](#三访问管理面板)
+    - [四、定制配置](#四定制配置)
+    - [五、升级与回退](#五升级与回退)
+    - [六、备份](#六备份)
+    - [七、常见问题](#七常见问题)
 - [配置详解](#配置详解)
   - [config.json](#configjson)
   - [credentials.json](#credentialsjson)
@@ -158,41 +167,117 @@ curl http://127.0.0.1:8990/v1/messages \
 
 ### Docker
 
-也可以通过 Docker 启动：
+> 推荐生产部署方式。镜像已预编译多架构二进制（linux/amd64、linux/arm64），开箱即用，无需安装 Rust 工具链。
+
+#### 一、最小部署
+
+只需要 `docker-compose.yml` + 一个空的数据目录：
 
 ```bash
-mkdir -p /opt/kiro-rs/data
-cd /opt/kiro-rs
-# 把仓库的 docker-compose.yml 放到这里即可
-```
-
-宿主机使用 `data/` 目录保存运行配置和凭据，容器内仍挂载为 `/app/config`。这样可以避免宿主机目录名 `config/` 和文件名 `config.json` 重复造成混淆：
-
-```text
-/opt/kiro-rs/
-├── docker-compose.yml
-└── data/                 # 首次启动后自动生成 config.json / credentials.json
-```
-
-`docker-compose.yml` 中的挂载关系：
-
-```yaml
-volumes:
-  - ./data/:/app/config/
-```
-
-启动：
-
-```bash
+mkdir -p /opt/kiro-rs/data && cd /opt/kiro-rs
+curl -O https://raw.githubusercontent.com/ZyphrZero/kiro.rs/master/docker-compose.yml
 docker compose up -d
 ```
 
-首次启动时如果 `data/config.json` 或 `data/credentials.json` 不存在，容器会自动生成：
+目录结构（首次启动后由容器自动生成 `config.json` / `credentials.json`）：
 
-- `config.json`：监听 `0.0.0.0:8990`，并随机生成 `apiKey`（`sk-kiro-rs-...`）和 `adminApiKey`（`sk-admin-...`）。容器日志里会打印一次这两个密钥，请记下来用于客户端调用和 Admin UI 登录；之后可直接编辑 `data/config.json` 修改。
-- `credentials.json`：写入空数组 `[]`，后续通过 Admin UI 添加凭据即可。
+```
+/opt/kiro-rs/
+├── docker-compose.yml
+└── data/                          # 持久化目录，挂载为容器内 /app/config
+    ├── config.json                # 自动生成，含随机 apiKey / adminApiKey
+    ├── credentials.json           # 自动生成的空数组 []，通过 Admin UI 添加
+    ├── client_api_keys.json       # 客户端 Key 分发（v0.4.0+，含明文 csk）
+    ├── usage_log.YYYY-MM-DD.jsonl # 按日滚动的请求用量日志（最多保留 31 天）
+    ├── kiro_balance_cache.json    # 上游凭据余额缓存
+    └── proxy_pool.json            # 代理池（如启用）
+```
 
-启动后访问 `http://服务器IP:8990/admin`，使用 `data/config.json` 中的 `adminApiKey` 登录管理页面。
+`docker-compose.yml` 默认包含 `kiro-rs` + `redis` 两个服务：
+
+- **kiro-rs**：监听 `8990`，挂载 `./data/:/app/config/`，`restart: unless-stopped`
+- **redis**：用于 prompt cache 加速；`appendonly` 开启，数据持久化到 named volume `redis-data`，附带 healthcheck
+
+#### 二、首次启动获取密钥
+
+容器首次启动会在日志里打印一次随机生成的密钥：
+
+```bash
+docker compose logs kiro-rs | grep -E "apiKey|adminApiKey"
+```
+
+输出形如：
+
+```
+apiKey      = sk-kiro-rs-3f8a9b2cQz...
+adminApiKey = sk-admin-x9KpRtVw...
+```
+
+- `apiKey` — 客户端调用 `/v1/messages` 时携带（`x-api-key` 或 `Authorization: Bearer`）
+- `adminApiKey` — 登录 `http://<host>:8990/admin` 管理界面用
+
+记下来后即可关闭日志窗口。也可以直接打开 `data/config.json` 查看或修改。
+
+#### 三、访问管理面板
+
+浏览器打开 `http://<服务器 IP>:8990/admin`，用 `adminApiKey` 登录。三个 Tab：
+
+- **概览** — Token 消耗趋势、按模型/凭据分布
+- **凭据管理** — 添加上游 Kiro 凭据（Social / IdC / API Key）
+- **客户端 Key** — 分发面向下游的 `csk_*` Key
+
+#### 四、定制配置
+
+**修改端口**：编辑 `docker-compose.yml` 把 `"8990:8990"` 改成 `"<host port>:8990"`，容器内端口保持 8990 不变。
+
+**自定义镜像 tag**：通过环境变量覆盖（默认 `zyphrzero/kiro-rs:latest`）：
+
+```bash
+KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.4.0 docker compose up -d
+```
+
+或写到 `.env` 文件：
+
+```
+KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.4.0
+```
+
+**关闭 Redis**：如果不需要 prompt cache，删除 `docker-compose.yml` 里的 `redis` 服务和 `kiro-rs.depends_on`，并把 `data/config.json` 中的 `redisUrl` 字段删除（或保持留空）。
+
+**配置 HTTP 代理**：在 `data/config.json` 加 `proxyUrl`，或在 Admin UI 的代理池里管理。
+
+#### 五、升级与回退
+
+**通过 Admin UI 在线更新**（推荐）：右上角点云朵图标 → 「更新并重启」。下载 GitHub Releases 二进制，校验 SHA256，原子替换 `<exe>`，旧版本备份到 `<exe>.backup`，进程退出后由 `restart: unless-stopped` 接管重启。失败完全无副作用，断网也能用 `<exe>.backup` 一键回退。
+
+也可以在 Admin UI 的「设置」里启用 **无人值守自动更新**（每天指定时间检查并应用新版本）。
+
+**手动升级**（拉新镜像）：
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+> 注意：手动 pull 升级与 Admin UI 在线更新使用的是不同的二进制路径——前者拉镜像里的二进制，后者下载 GitHub Releases 并写到容器卷。两种方式都安全，不会互相干扰，但建议固定使用其中一种以便追踪版本。
+
+#### 六、备份
+
+`data/` 目录是唯一的状态来源，定期备份即可：
+
+```bash
+tar -czf kiro-rs-backup-$(date +%F).tar.gz /opt/kiro-rs/data/
+```
+
+> ⚠️ 备份包含明文凭据（`credentials.json`）和明文客户端 Key（`client_api_keys.json`），请加密保存或限制访问权限。
+
+恢复时把备份解压回 `/opt/kiro-rs/data/` 后 `docker compose restart` 即可。
+
+#### 七、常见问题
+
+- **首次启动看不到日志中的密钥** — 改用 `docker compose logs --tail=200 kiro-rs`，或直接看 `data/config.json` 里的 `apiKey` / `adminApiKey` 字段
+- **想从 Docker Hub 之外的镜像源拉取** — 把 `docker-compose.yml` 里的 `image:` 改成你自己镜像源的地址（如 `ghcr.io/...`、阿里云镜像加速等）
+- **客户端连接 Redis 失败** — 容器之间用服务名通信，`redisUrl` 应保持为 `redis://redis:6379`（不是 `127.0.0.1`）
+- **Admin UI 显示 "暂无数据"** — 仪表盘需要至少一次请求才会有数据，先用 curl 调一次 `/v1/messages` 即可看到趋势开始填充
 
 ## 配置详解
 
@@ -481,7 +566,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 当 `config.json` 配置了非空 `adminApiKey` 时，会启用：
 
-- **Admin API（认证同 API Key）**
+- **凭据管理 API**
   - `GET /api/admin/credentials` - 获取所有凭据状态
   - `POST /api/admin/credentials` - 添加新凭据
   - `DELETE /api/admin/credentials/:id` - 删除凭据
@@ -490,8 +575,23 @@ RUST_LOG=debug ./target/release/kiro-rs
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
 
-- **Admin UI**
-  - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
+- **客户端 Key 分发 API**（v0.4.0+）
+  - `GET /api/admin/client-keys` - 列出所有客户端 Key（脱敏展示）
+  - `POST /api/admin/client-keys` - 创建新 Key（响应里返回明文，仅此一次）
+  - `PUT /api/admin/client-keys/:id` - 修改名称 / 描述
+  - `DELETE /api/admin/client-keys/:id` - 删除 Key
+  - `POST /api/admin/client-keys/:id/disabled` - 启用/禁用
+  - `POST /api/admin/client-keys/:id/reset-stats` - 重置累计计数
+
+- **用量统计 API**（v0.4.0+）
+  - `GET /api/admin/stats/overview` - 今日 / 最近 7 天概览
+  - `GET /api/admin/stats/timeseries?range=24h|7d|30d` - 时序点
+  - `GET /api/admin/stats/by-model?range=...` - 按模型分布
+  - `GET /api/admin/stats/by-credential?range=...` - 按上游凭据分布
+
+- **Admin UI**（v0.4.0+ 升级为三 Tab SPA）
+  - `GET /admin` - 概览 / 凭据管理 / 客户端 Key
+  - 顶栏统一工具：负载均衡切换、刷新、在线更新、Key 管理（修改 Admin Key 与业务 API Key）
 
 ### 在线更新
 
