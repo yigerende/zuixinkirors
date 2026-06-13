@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.6] - 2026-06-13
+
+主题：**Native WebSearch 工具检测收窄**。此前 web_search 工具识别仅按 `name == "web_search"` 匹配，会把客户端自定义的同名普通工具误判为 Anthropic 原生 web_search，导致不该进入内部搜索循环的请求被错误路由。
+
+### 🛠 修复 — 来自社区贡献
+
+感谢以下 PR 贡献者 🙏
+
+- **Native web_search 工具检测收窄为类型匹配**（PR #17 @XuDONGCui）：`web_search` 工具识别从仅按名称匹配改为「名称 + `tool_type` 前缀」双重判定——只有 `name == "web_search"` 且 `tool_type` 以 `web_search_` 开头的 Anthropic 原生工具才会触发内部搜索循环。客户端自定义的、恰巧也命名为 `web_search` 的普通工具不再被误判，确保混合工具集请求走正常的对话路径。新增对应单测验证两类工具的区分行为，同步覆盖纯 web_search、混合工具及自定义同名工具的识别场景。
+
 ## [0.6.5] - 2026-06-11
 
 主题：**Claude Code 字面工具调用容错 + 退化复读熔断**。这一版聚焦 Anthropic 兼容层在上游退化输出下的稳定性：当 Claude Code 场景中本应结构化返回的工具调用泄漏成字面 `<invoke>` 文本时，中转层会在严格边界内恢复为真实 `tool_use`；同时新增异常引导词复读熔断，避免 `call` / `count` / `card` 等垃圾文本刷屏、耗尽输出预算或污染会话历史。
