@@ -16,6 +16,28 @@ function Require-Command {
 
 Require-Command "git"
 
+$ProjectProxy = "http://127.0.0.1:18081"
+
+function Invoke-Push {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Branch
+    )
+
+    Write-Host "Trying direct push..."
+    git push origin $Branch
+    if ($LASTEXITCODE -eq 0) {
+        return
+    }
+
+    Write-Host ""
+    Write-Host "Direct push failed. Trying project-only proxy: $ProjectProxy"
+    git -c "http.proxy=$ProjectProxy" -c "https.proxy=$ProjectProxy" push origin $Branch
+    if ($LASTEXITCODE -ne 0) {
+        throw "Push failed with direct connection and project-only proxy."
+    }
+}
+
 $message = ($args -join " ").Trim()
 if ([string]::IsNullOrWhiteSpace($message)) {
     $message = "update: local changes $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
@@ -44,7 +66,7 @@ if (-not [string]::IsNullOrWhiteSpace($changes)) {
 
 Write-Host ""
 Write-Host "Pushing to origin/$branch..."
-git push origin $branch
+Invoke-Push -Branch $branch
 
 $ahead = git rev-list --count "origin/$branch..HEAD" 2>$null
 if (-not [string]::IsNullOrWhiteSpace($ahead) -and [int]$ahead -gt 0) {
