@@ -14,6 +14,7 @@ export interface InputScaleSegment {
 
 export interface CacheOptimizerConfig {
   enabled: boolean
+  clientKeyIds: number[]
   enabledStream: boolean
   enabledNonStream: boolean
   enabledBuffered: boolean

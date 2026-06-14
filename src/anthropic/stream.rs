@@ -1090,6 +1090,8 @@ pub struct StreamContext {
     pub cache_usage: super::cache_metering::CacheUsage,
     /// 模拟缓存配置：只用于最终返回给下游的 usage 字段。
     pub cache_optimizer: Option<Arc<parking_lot::RwLock<CacheOptimizerConfig>>>,
+    /// 当前请求命中的客户端 Key id；模拟缓存可按 Key 白名单生效。
+    pub key_id: u64,
     /// meteringEvent 上报的 credit 计费量（上游真实下发）
     pub credits: f64,
     /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
@@ -1125,6 +1127,7 @@ impl StreamContext {
             read,
             &optimizer.read(),
             path,
+            self.key_id,
         );
         (
             simulated.input_tokens,
@@ -1163,6 +1166,7 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
             cache_optimizer: None,
+            key_id: 0,
             credits: 0.0,
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
@@ -2237,6 +2241,10 @@ impl BufferedStreamContext {
         optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
     ) {
         self.inner.cache_optimizer = Some(optimizer);
+    }
+
+    pub fn set_key_id(&mut self, key_id: u64) {
+        self.inner.key_id = key_id;
     }
 
     /// 处理 Kiro 事件并缓冲结果

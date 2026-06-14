@@ -760,6 +760,7 @@ pub async fn post_messages(
             state.cache_optimizer.clone(),
             tracer,
             key_ctx.group.clone(),
+            key_ctx.key_id,
         )
         .await
     } else {
@@ -786,6 +787,7 @@ pub async fn post_messages(
             state.cache_optimizer.clone(),
             tracer,
             key_ctx.group.clone(),
+            key_ctx.key_id,
         )
         .await
     }
@@ -805,6 +807,7 @@ async fn handle_stream_request(
     cache_optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    key_id: u64,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
@@ -838,6 +841,7 @@ async fn handle_stream_request(
     );
     ctx.cache_usage = cache_usage;
     ctx.cache_optimizer = Some(cache_optimizer);
+    ctx.key_id = key_id;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1043,6 +1047,7 @@ async fn handle_non_stream_request(
     cache_optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    key_id: u64,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
@@ -1241,6 +1246,7 @@ async fn handle_non_stream_request(
         cache_read_tokens,
         &cache_optimizer.read(),
         super::cache_rewriter::ResponsePath::NonStream,
+        key_id,
     );
 
     // 构建 Anthropic 响应
@@ -1600,6 +1606,7 @@ pub async fn post_messages_cc(
             state.cache_optimizer.clone(),
             tracer,
             key_ctx.group.clone(),
+            key_ctx.key_id,
         )
         .await
     } else {
@@ -1626,6 +1633,7 @@ pub async fn post_messages_cc(
             state.cache_optimizer.clone(),
             tracer,
             key_ctx.group.clone(),
+            key_ctx.key_id,
         )
         .await
     }
@@ -1648,6 +1656,7 @@ async fn handle_stream_request_buffered(
     cache_optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    key_id: u64,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
@@ -1680,6 +1689,7 @@ async fn handle_stream_request_buffered(
     );
     ctx.set_cache_usage(cache_usage);
     ctx.set_cache_optimizer(cache_optimizer);
+    ctx.set_key_id(key_id);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);

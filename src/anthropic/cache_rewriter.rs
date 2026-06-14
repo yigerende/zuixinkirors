@@ -25,7 +25,17 @@ pub(crate) fn rewrite_usage_for_response(
     cache_read_tokens: i32,
     config: &CacheOptimizerConfig,
     path: ResponsePath,
+    key_id: u64,
 ) -> SimulatedUsage {
+    if !applies_to_client_key(config, key_id) {
+        return SimulatedUsage {
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        };
+    }
+
     if config.input_only_random_enabled && config.input_only_random_max > 0 {
         return SimulatedUsage {
             input_tokens: random_in_range(1, config.input_only_random_max as u64),
@@ -67,13 +77,17 @@ pub(crate) fn rewrite_usage_for_response(
         total_input_tokens,
         config,
     );
-    let input_tokens = rewrite_input_tokens(config, path).unwrap_or(input_tokens);
+    let input_tokens = rewrite_input_tokens(config, path, key_id).unwrap_or(input_tokens);
     SimulatedUsage {
         input_tokens,
         output_tokens,
         cache_creation_tokens: new_creation,
         cache_read_tokens: new_read,
     }
+}
+
+pub(crate) fn applies_to_client_key(config: &CacheOptimizerConfig, key_id: u64) -> bool {
+    config.client_key_ids.is_empty() || config.client_key_ids.contains(&key_id)
 }
 
 fn path_enabled(config: &CacheOptimizerConfig, path: ResponsePath) -> bool {
@@ -255,7 +269,11 @@ pub(crate) fn rewrite_cache_usage_with_split(
 pub(crate) fn rewrite_input_tokens(
     config: &CacheOptimizerConfig,
     path: ResponsePath,
+    key_id: u64,
 ) -> Option<i32> {
+    if !applies_to_client_key(config, key_id) {
+        return None;
+    }
     if !config.enabled {
         return None;
     }
@@ -477,7 +495,7 @@ mod tests {
         let mut config = make_config("weighted", true);
         config.input_random_max = 10;
         for _ in 0..500 {
-            let v = rewrite_input_tokens(&config, ResponsePath::Stream)
+            let v = rewrite_input_tokens(&config, ResponsePath::Stream, 0)
                 .expect("input_random_max > 0 should rewrite");
             assert!(v >= 1 && v <= 10, "input {v} out of [1,10]");
         }
@@ -487,7 +505,7 @@ mod tests {
     fn rewrite_input_tokens_disabled_when_max_zero() {
         let mut config = make_config("weighted", true);
         config.input_random_max = 0;
-        assert_eq!(rewrite_input_tokens(&config, ResponsePath::Stream), None);
+        assert_eq!(rewrite_input_tokens(&config, ResponsePath::Stream, 0), None);
     }
 
     #[test]
@@ -497,7 +515,8 @@ mod tests {
         config.probe_bypass_non_stream = true;
         config.input_random_max = 10;
 
-        let usage = rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::NonStream);
+        let usage =
+            rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::NonStream, 0);
 
         assert_eq!(
             usage,
@@ -522,7 +541,7 @@ mod tests {
             write_multiplier: 9.0,
         }];
 
-        let usage = rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream);
+        let usage = rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 0);
 
         assert_eq!(
             usage,
@@ -548,7 +567,7 @@ mod tests {
             write_multiplier: 9.0,
         }];
 
-        let usage = rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream);
+        let usage = rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 0);
 
         assert_eq!(
             usage,
@@ -574,7 +593,7 @@ mod tests {
             write_multiplier: 3.0,
         }];
 
-        let usage = rewrite_usage_for_response(100, 20, 500, 800, &config, ResponsePath::Stream);
+        let usage = rewrite_usage_for_response(100, 20, 500, 800, &config, ResponsePath::Stream, 0);
 
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 20);
@@ -589,7 +608,7 @@ mod tests {
 
         for _ in 0..100 {
             let usage =
-                rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Buffered);
+                rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Buffered, 0);
 
             assert!(
                 (1..=5).contains(&usage.input_tokens),
@@ -620,7 +639,7 @@ mod tests {
 
         for _ in 0..100 {
             let usage =
-                rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream);
+                rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 0);
 
             assert!(
                 (1..=7).contains(&usage.input_tokens),
@@ -652,7 +671,7 @@ mod tests {
 
         for _ in 0..100 {
             let usage =
-                rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream);
+                rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 0);
 
             assert!(
                 (1..=9).contains(&usage.input_tokens),
@@ -665,9 +684,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn client_key_scope_empty_means_all_keys_and_non_matching_key_is_passthrough() {
+        let mut config = make_config("zero", true);
+
+        let all_keys_usage =
+            rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 11);
+        assert_eq!(all_keys_usage.cache_creation_tokens, 0);
+        assert_eq!(all_keys_usage.cache_read_tokens, 0);
+
+        config.client_key_ids = vec![7, 9];
+        let blocked_usage =
+            rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 11);
+        assert_eq!(
+            blocked_usage,
+            SimulatedUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_creation_tokens: 300,
+                cache_read_tokens: 400,
+            }
+        );
+
+        let matching_usage =
+            rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 9);
+        assert_eq!(matching_usage.cache_creation_tokens, 0);
+        assert_eq!(matching_usage.cache_read_tokens, 0);
+    }
+
     fn screenshot_config() -> CacheOptimizerConfig {
         CacheOptimizerConfig {
             enabled: true,
+            client_key_ids: Vec::new(),
             enabled_stream: true,
             enabled_non_stream: true,
             enabled_buffered: false,
@@ -760,7 +808,7 @@ mod tests {
     #[test]
     fn screenshot_config_probe_bypass_keeps_small_requests_original() {
         let config = screenshot_config();
-        let usage = rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream);
+        let usage = rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 0);
         assert_eq!(
             usage,
             SimulatedUsage {
@@ -776,7 +824,7 @@ mod tests {
     fn screenshot_config_buffered_path_is_disabled() {
         let config = screenshot_config();
         let usage =
-            rewrite_usage_for_response(10_000, 20, 300, 400, &config, ResponsePath::Buffered);
+            rewrite_usage_for_response(10_000, 20, 300, 400, &config, ResponsePath::Buffered, 0);
         assert_eq!(
             usage,
             SimulatedUsage {
@@ -799,6 +847,7 @@ mod tests {
                 150_000,
                 &config,
                 ResponsePath::NonStream,
+                0,
             );
             assert!(
                 (1..=2_000).contains(&usage.input_tokens),
@@ -875,7 +924,7 @@ mod tests {
                 "关闭时四字段必须原样返回"
             );
             assert_eq!(
-                rewrite_input_tokens(&config, path),
+                rewrite_input_tokens(&config, path, 0),
                 None,
                 "关闭时 input 不改写"
             );
@@ -1051,7 +1100,11 @@ mod tests {
         config.probe_bypass_stream = true;
 
         assert!(should_bypass_for_probe(&config, ResponsePath::Stream, 1388));
-        assert!(!should_bypass_for_probe(&config, ResponsePath::Stream, 1387));
+        assert!(!should_bypass_for_probe(
+            &config,
+            ResponsePath::Stream,
+            1387
+        ));
     }
 
     // ===== 输入放大测试 =====

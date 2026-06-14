@@ -39,6 +39,8 @@ pub struct InputScaleSegment {
 pub struct CacheOptimizerConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub client_key_ids: Vec<u64>,
     #[serde(default = "default_true")]
     pub enabled_stream: bool,
     #[serde(default = "default_true")]
@@ -167,6 +169,7 @@ impl Default for CacheOptimizerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            client_key_ids: Vec::new(),
             enabled_stream: true,
             enabled_non_stream: true,
             enabled_buffered: true,

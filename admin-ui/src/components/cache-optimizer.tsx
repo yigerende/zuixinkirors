@@ -4,10 +4,12 @@ import { RefreshCw } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { useCacheOptimizer, useSetCacheOptimizer } from '@/hooks/use-cache-optimizer'
+import { useClientKeys } from '@/hooks/use-client-keys'
 import type { CacheOptimizerConfig, CacheSegment, InputScaleSegment } from '@/types/api'
 
 const DEFAULT_CONFIG: CacheOptimizerConfig = {
   enabled: false,
+  clientKeyIds: [],
   enabledStream: true,
   enabledNonStream: true,
   enabledBuffered: true,
@@ -96,6 +98,7 @@ function weightedSegmentAvg(segments: CacheSegment[]): number {
 
 export function CacheOptimizer() {
   const { data, isLoading, refetch } = useCacheOptimizer()
+  const { data: clientKeysData, isLoading: isClientKeysLoading } = useClientKeys()
   const { mutate: save, isPending: isSaving } = useSetCacheOptimizer()
   const [form, setForm] = useState<CacheOptimizerConfig>(DEFAULT_CONFIG)
   const [probeBypassExactInput, setProbeBypassExactInput] = useState('')
@@ -140,6 +143,20 @@ export function CacheOptimizer() {
       probeBypassInputTokenValues: prev.probeBypassInputTokenValues.filter(item => item !== value),
     }))
   }
+
+  const toggleClientKey = (id: number) => {
+    setForm(prev => {
+      const selected = prev.clientKeyIds.includes(id)
+      return {
+        ...prev,
+        clientKeyIds: selected
+          ? prev.clientKeyIds.filter(item => item !== id)
+          : [...prev.clientKeyIds, id].sort((a, b) => a - b),
+      }
+    })
+  }
+
+  const clearClientKeyScope = () => updateField('clientKeyIds', [])
 
   const updateSegment = (type: 'readSegments' | 'writeSegments', index: number, field: keyof CacheSegment, value: number) => {
     setForm(prev => {
@@ -223,6 +240,55 @@ export function CacheOptimizer() {
               }`} />
             </button>
           </label>
+        </CardContent>
+      </Card>
+
+      {/* 适用客户端 Key */}
+      <Card className="mb-6">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm">适用客户端 Key</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-xs text-muted-foreground">
+              未选择时全部客户端 Key 的请求都生效；选择一个或多个后，只对这些 Key 的请求生效。
+            </p>
+            {form.clientKeyIds.length > 0 && (
+              <Button type="button" variant="outline" size="sm" onClick={clearClientKeyScope}>
+                全部 Key
+              </Button>
+            )}
+          </div>
+          {isClientKeysLoading ? (
+            <div className="text-xs text-muted-foreground">正在加载客户端 Key...</div>
+          ) : clientKeysData?.keys.length ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+              {clientKeysData.keys.map(key => (
+                <label
+                  key={key.id}
+                  className={`flex items-center gap-3 rounded-md border p-3 text-sm ${
+                    form.clientKeyIds.includes(key.id) ? 'border-primary bg-primary/5' : 'border-border bg-background'
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={form.clientKeyIds.includes(key.id)}
+                    onChange={() => toggleClientKey(key.id)}
+                  />
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="truncate font-medium">{key.name}</span>
+                      <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">#{key.id}</span>
+                      {key.disabled && <span className="shrink-0 rounded bg-destructive/10 px-1.5 py-0.5 text-xs text-destructive">已禁用</span>}
+                    </div>
+                    <div className="truncate text-xs text-muted-foreground">{key.maskedKey}</div>
+                  </div>
+                </label>
+              ))}
+            </div>
+          ) : (
+            <div className="text-xs text-muted-foreground">暂无客户端 Key</div>
+          )}
         </CardContent>
       </Card>
 
