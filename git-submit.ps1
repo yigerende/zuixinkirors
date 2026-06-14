@@ -36,13 +36,20 @@ Write-Host ""
 git add -A
 
 $changes = git status --porcelain
-if ([string]::IsNullOrWhiteSpace($changes)) {
-    Write-Host "No changes to commit."
-    exit 0
+if (-not [string]::IsNullOrWhiteSpace($changes)) {
+    git commit -m $message
+} else {
+    Write-Host "No file changes to commit."
 }
 
-git commit -m $message
+Write-Host ""
+Write-Host "Pushing to origin/$branch..."
 git push origin $branch
+
+$ahead = git rev-list --count "origin/$branch..HEAD" 2>$null
+if (-not [string]::IsNullOrWhiteSpace($ahead) -and [int]$ahead -gt 0) {
+    throw "Push did not complete. Local branch is still ahead of origin/$branch by $ahead commit(s)."
+}
 
 Write-Host ""
 Write-Host "Commit and push completed."
