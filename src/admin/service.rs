@@ -19,18 +19,16 @@ use crate::model::config::{CacheOptimizerConfig, Config};
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
-    AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse,
-    BalanceResponse, BatchAddProxyRequest,
-    CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
-    GitHubRateLimitInfo, ImageUpdateResponse, ExportedAccount, ExportedCredentials,
-    CredentialsExportResponse,
-    LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
-    ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
-    QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-    StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
-    UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
+    AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
+    BatchAddProxyRequest, CheckRateLimitRequest, CredentialStatusItem, CredentialsExportResponse,
+    CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
+    GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
+    LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
+    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetUpdateConfigRequest,
+    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
+    UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -243,7 +241,10 @@ const BUILD_TYPE: &str = "binary";
 /// 文件名中带版本号，便于 apply 复用 pull 已下载的二进制（命中时跳过重新下载）。
 fn staged_binary_path(exe: &std::path::Path, version: &str) -> std::path::PathBuf {
     let mut s = exe.as_os_str().to_os_string();
-    s.push(format!(".staged-{}", version.trim().trim_start_matches('v')));
+    s.push(format!(
+        ".staged-{}",
+        version.trim().trim_start_matches('v')
+    ));
     std::path::PathBuf::from(s)
 }
 
@@ -916,8 +917,8 @@ impl AdminService {
                         );
 
                         let hit = now.hour() == target_hour && now.minute() == target_minute;
-                        let already_ran_this_minute = last_run_marker.as_deref()
-                            == Some(date_minute_marker.as_str());
+                        let already_ran_this_minute =
+                            last_run_marker.as_deref() == Some(date_minute_marker.as_str());
 
                         if hit && !already_ran_this_minute {
                             last_run_marker = Some(date_minute_marker);
@@ -933,7 +934,7 @@ impl AdminService {
                                     info.latest_version,
                                     info.current_version
                                 );
-                            match svc.apply_image_update().await {
+                                match svc.apply_image_update().await {
                                     Ok(res) => {
                                         tracing::info!("自动更新完成：{}", res.message);
                                         last_applied_version = Some(info.latest_version);
@@ -1221,10 +1222,7 @@ impl AdminService {
             message: if reused {
                 format!("v{} 已下载并校验，可直接执行「更新并重启」", version)
             } else {
-                format!(
-                    "已下载并校验 v{} 二进制，可直接执行「更新并重启」",
-                    version
-                )
+                format!("已下载并校验 v{} 二进制，可直接执行「更新并重启」", version)
             },
             output: Some(format!(
                 "{}: v{}\nstaged: {}",
@@ -1489,10 +1487,7 @@ impl AdminService {
     /// `req.github_token` 不为空时使用该 token 验证（用于"保存前先试一下"），
     /// 否则使用配置中已保存的 `config.github_token`，再缺则匿名查询。
     /// `/rate_limit` 端点本身不消耗任何配额。
-    pub async fn check_rate_limit(
-        &self,
-        req: CheckRateLimitRequest,
-    ) -> GitHubRateLimitInfo {
+    pub async fn check_rate_limit(&self, req: CheckRateLimitRequest) -> GitHubRateLimitInfo {
         // 优先用入参 token；空字符串视作"尝试匿名"；缺省回退到已保存 token
         let token = req
             .github_token
@@ -1608,13 +1603,22 @@ impl AdminService {
             .get("resources")
             .and_then(|r| r.get("core"))
             .or_else(|| payload.get("rate"));
-        let limit = core.and_then(|c| c.get("limit")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let limit = core
+            .and_then(|c| c.get("limit"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let remaining = core
             .and_then(|c| c.get("remaining"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let used = core.and_then(|c| c.get("used")).and_then(|v| v.as_u64()).unwrap_or(0);
-        let reset = core.and_then(|c| c.get("reset")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let used = core
+            .and_then(|c| c.get("used"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let reset = core
+            .and_then(|c| c.get("reset"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
 
         // 同时尝试拿 token 对应的用户名；失败不影响主结果
         let login = if authenticated {
@@ -1862,9 +1866,9 @@ impl AdminService {
                 skipped.push(entry.id);
                 continue;
             }
-            let cached = cache_snapshot.get(&entry.id).filter(|c| {
-                (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64
-            });
+            let cached = cache_snapshot
+                .get(&entry.id)
+                .filter(|c| (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64);
 
             match cached {
                 // 缓存命中：明确不可开启，跳过
@@ -1887,7 +1891,11 @@ impl AdminService {
         let mut failure_messages: Vec<String> = Vec::new();
 
         for id in targets {
-            match self.token_manager.set_user_preference_for(id, "ENABLED").await {
+            match self
+                .token_manager
+                .set_user_preference_for(id, "ENABLED")
+                .await
+            {
                 Ok(()) => {
                     enabled_ids.push(id);
                     // 失效本地缓存
@@ -2934,9 +2942,8 @@ mod tests {
         cred.email = Some("e@example.com".to_string());
         cred.expires_at = Some("2026-06-06T00:00:00Z".to_string());
         // 占位符 profileArn 应在导出时被剥离
-        cred.profile_arn = Some(
-            crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string(),
-        );
+        cred.profile_arn =
+            Some(crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string());
 
         let acc = credential_to_export_account(cred).expect("应生成账号");
 
@@ -2969,7 +2976,10 @@ mod tests {
         assert_eq!(subscription_type_from_title(Some("KIRO FREE")), "Free");
         assert_eq!(subscription_type_from_title(Some("KIRO PRO+")), "Pro_Plus");
         assert_eq!(subscription_type_from_title(Some("KIRO PRO")), "Pro");
-        assert_eq!(subscription_type_from_title(Some("KIRO POWER")), "Enterprise");
+        assert_eq!(
+            subscription_type_from_title(Some("KIRO POWER")),
+            "Enterprise"
+        );
         assert_eq!(subscription_type_from_title(None), "Free");
     }
 }

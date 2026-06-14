@@ -86,10 +86,11 @@ fn path_enabled(config: &CacheOptimizerConfig, path: ResponsePath) -> bool {
 
 /// 探活豁免判断：请求输入过小（如渠道探活）时，应跳过模拟缓存改写、原样真实返回。
 ///
-/// 条件（全部满足才豁免）：
-/// 1. 配置了阈值 `probe_bypass_max_input_tokens`（None=不启用）
-/// 2. 当前响应路径在豁免开关里被勾选
-/// 3. 请求输入 token（估算值，非上游返回）≤ 阈值
+/// 条件：
+/// 1. 当前响应路径在豁免开关里被勾选
+/// 2. 请求输入 token（估算值，非上游返回）满足任一规则：
+///    - ≤ `probe_bypass_max_input_tokens`
+///    - = `probe_bypass_input_token_values` 中任一值
 ///
 /// `request_input_tokens` 必须是「请求进来时估算的输入」。
 #[allow(dead_code)]
@@ -98,18 +99,22 @@ pub(crate) fn should_bypass_for_probe(
     path: ResponsePath,
     request_input_tokens: i32,
 ) -> bool {
-    let Some(threshold) = config.probe_bypass_max_input_tokens else {
-        return false;
-    };
     let path_enabled = match path {
         ResponsePath::Stream => config.probe_bypass_stream,
         ResponsePath::NonStream => config.probe_bypass_non_stream,
         ResponsePath::Buffered => config.probe_bypass_buffered,
     };
-    if !path_enabled {
+    if !path_enabled || request_input_tokens < 0 {
         return false;
     }
-    request_input_tokens >= 0 && (request_input_tokens as u64) <= threshold
+    let input = request_input_tokens as u64;
+    config
+        .probe_bypass_max_input_tokens
+        .is_some_and(|threshold| input <= threshold)
+        || config
+            .probe_bypass_input_token_values
+            .iter()
+            .any(|value| *value == input)
 }
 
 /// 输入放大：按上游真实输入分档，对（模拟改写后的）读/写缓存乘倍率。
@@ -492,14 +497,7 @@ mod tests {
         config.probe_bypass_non_stream = true;
         config.input_random_max = 10;
 
-        let usage = rewrite_usage_for_response(
-            100,
-            20,
-            300,
-            400,
-            &config,
-            ResponsePath::NonStream,
-        );
+        let usage = rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::NonStream);
 
         assert_eq!(
             usage,
@@ -524,14 +522,7 @@ mod tests {
             write_multiplier: 9.0,
         }];
 
-        let usage = rewrite_usage_for_response(
-            100,
-            20,
-            300,
-            400,
-            &config,
-            ResponsePath::Stream,
-        );
+        let usage = rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream);
 
         assert_eq!(
             usage,
@@ -557,14 +548,7 @@ mod tests {
             write_multiplier: 9.0,
         }];
 
-        let usage = rewrite_usage_for_response(
-            100,
-            20,
-            300,
-            400,
-            &config,
-            ResponsePath::Stream,
-        );
+        let usage = rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream);
 
         assert_eq!(
             usage,
@@ -590,14 +574,7 @@ mod tests {
             write_multiplier: 3.0,
         }];
 
-        let usage = rewrite_usage_for_response(
-            100,
-            20,
-            500,
-            800,
-            &config,
-            ResponsePath::Stream,
-        );
+        let usage = rewrite_usage_for_response(100, 20, 500, 800, &config, ResponsePath::Stream);
 
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 20);
@@ -611,14 +588,8 @@ mod tests {
         config.input_random_max = 5;
 
         for _ in 0..100 {
-            let usage = rewrite_usage_for_response(
-                100,
-                20,
-                300,
-                400,
-                &config,
-                ResponsePath::Buffered,
-            );
+            let usage =
+                rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Buffered);
 
             assert!(
                 (1..=5).contains(&usage.input_tokens),
@@ -648,14 +619,8 @@ mod tests {
         }];
 
         for _ in 0..100 {
-            let usage = rewrite_usage_for_response(
-                100,
-                20,
-                300,
-                400,
-                &config,
-                ResponsePath::Stream,
-            );
+            let usage =
+                rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream);
 
             assert!(
                 (1..=7).contains(&usage.input_tokens),
@@ -686,14 +651,8 @@ mod tests {
         }];
 
         for _ in 0..100 {
-            let usage = rewrite_usage_for_response(
-                100,
-                20,
-                300,
-                400,
-                &config,
-                ResponsePath::Stream,
-            );
+            let usage =
+                rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream);
 
             assert!(
                 (1..=9).contains(&usage.input_tokens),
@@ -762,6 +721,7 @@ mod tests {
             rewrite_only_when_present: false,
             keep_raw_breakdown: true,
             probe_bypass_max_input_tokens: Some(1_000),
+            probe_bypass_input_token_values: Vec::new(),
             probe_bypass_stream: true,
             probe_bypass_non_stream: true,
             probe_bypass_buffered: false,
@@ -815,14 +775,8 @@ mod tests {
     #[test]
     fn screenshot_config_buffered_path_is_disabled() {
         let config = screenshot_config();
-        let usage = rewrite_usage_for_response(
-            10_000,
-            20,
-            300,
-            400,
-            &config,
-            ResponsePath::Buffered,
-        );
+        let usage =
+            rewrite_usage_for_response(10_000, 20, 300, 400, &config, ResponsePath::Buffered);
         assert_eq!(
             usage,
             SimulatedUsage {
@@ -1066,6 +1020,38 @@ mod tests {
         ));
         // 流式没勾选 → 不豁免（即便输入小）
         assert!(!should_bypass_for_probe(&config, ResponsePath::Stream, 10));
+    }
+
+    #[test]
+    fn probe_bypass_respects_exact_input_values() {
+        let mut config = make_config("weighted", true);
+        config.probe_bypass_max_input_tokens = Some(100);
+        config.probe_bypass_input_token_values = vec![1388, 4096];
+        config.probe_bypass_stream = true;
+
+        assert!(should_bypass_for_probe(&config, ResponsePath::Stream, 1388));
+        assert!(should_bypass_for_probe(&config, ResponsePath::Stream, 4096));
+        assert!(!should_bypass_for_probe(
+            &config,
+            ResponsePath::Stream,
+            4097
+        ));
+        assert!(!should_bypass_for_probe(
+            &config,
+            ResponsePath::NonStream,
+            1388
+        ));
+    }
+
+    #[test]
+    fn probe_bypass_exact_values_work_without_threshold() {
+        let mut config = make_config("weighted", true);
+        config.probe_bypass_max_input_tokens = None;
+        config.probe_bypass_input_token_values = vec![1388];
+        config.probe_bypass_stream = true;
+
+        assert!(should_bypass_for_probe(&config, ResponsePath::Stream, 1388));
+        assert!(!should_bypass_for_probe(&config, ResponsePath::Stream, 1387));
     }
 
     // ===== 输入放大测试 =====

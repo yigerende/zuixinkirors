@@ -37,6 +37,7 @@ const DEFAULT_CONFIG: CacheOptimizerConfig = {
   inputOnlyRandomEnabled: false,
   inputOnlyRandomMax: 0,
   probeBypassMaxInputTokens: null,
+  probeBypassInputTokenValues: [],
   probeBypassStream: false,
   probeBypassNonStream: false,
   probeBypassBuffered: false,
@@ -97,6 +98,7 @@ export function CacheOptimizer() {
   const { data, isLoading, refetch } = useCacheOptimizer()
   const { mutate: save, isPending: isSaving } = useSetCacheOptimizer()
   const [form, setForm] = useState<CacheOptimizerConfig>(DEFAULT_CONFIG)
+  const [probeBypassExactInput, setProbeBypassExactInput] = useState('')
 
   useEffect(() => {
     // 合并默认值兜底：老配置可能缺少新增字段（探活豁免/输入放大）
@@ -114,6 +116,29 @@ export function CacheOptimizer() {
 
   const updateField = <K extends keyof CacheOptimizerConfig>(key: K, value: CacheOptimizerConfig[K]) => {
     setForm(prev => ({ ...prev, [key]: value }))
+  }
+
+  const addProbeBypassExactValue = () => {
+    const value = Number(probeBypassExactInput.trim())
+    if (!Number.isInteger(value) || value < 0) {
+      toast.error('请输入非负整数 Token')
+      return
+    }
+    setForm(prev => {
+      if (prev.probeBypassInputTokenValues.includes(value)) return prev
+      return {
+        ...prev,
+        probeBypassInputTokenValues: [...prev.probeBypassInputTokenValues, value].sort((a, b) => a - b),
+      }
+    })
+    setProbeBypassExactInput('')
+  }
+
+  const removeProbeBypassExactValue = (value: number) => {
+    setForm(prev => ({
+      ...prev,
+      probeBypassInputTokenValues: prev.probeBypassInputTokenValues.filter(item => item !== value),
+    }))
   }
 
   const updateSegment = (type: 'readSegments' | 'writeSegments', index: number, field: keyof CacheSegment, value: number) => {
@@ -507,7 +532,7 @@ export function CacheOptimizer() {
         </CardHeader>
         <CardContent className="space-y-3">
           <p className="text-xs text-muted-foreground">
-            渠道探活等小请求：当「请求输入 token」≤ 阈值时，该请求完全不改写、原样真实返回（相当于这条请求关闭模拟缓存）。阈值留空=不启用。判断用请求进来的输入，不是上游返回。
+            渠道探活等小请求：当「请求输入 token」≤ 阈值，或等于下方任一指定值时，该请求完全不改写、原样真实返回（相当于这条请求关闭模拟缓存）。判断用请求进来的输入，不是上游返回。
           </p>
           <div className="flex items-center gap-3 flex-wrap">
             <span className="text-sm font-medium">输入阈值(≤)</span>
@@ -519,6 +544,46 @@ export function CacheOptimizer() {
               onChange={e => updateField('probeBypassMaxInputTokens', e.target.value === '' ? null : Number(e.target.value))}
               className="w-40 h-9 rounded-md border border-input bg-background px-3 text-sm"
             />
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-3 flex-wrap">
+              <span className="text-sm font-medium">输入等于(=)</span>
+              <input
+                type="number"
+                min={0}
+                placeholder="输入后按回车"
+                value={probeBypassExactInput}
+                onChange={e => setProbeBypassExactInput(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    addProbeBypassExactValue()
+                  }
+                }}
+                className="w-40 h-9 rounded-md border border-input bg-background px-3 text-sm"
+              />
+              <Button type="button" variant="outline" size="sm" onClick={addProbeBypassExactValue}>
+                添加
+              </Button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {form.probeBypassInputTokenValues.length === 0 ? (
+                <span className="text-xs text-muted-foreground">未配置等值豁免</span>
+              ) : (
+                form.probeBypassInputTokenValues.map(value => (
+                  <button
+                    type="button"
+                    key={value}
+                    onClick={() => removeProbeBypassExactValue(value)}
+                    className="inline-flex items-center gap-1 rounded-md border border-input bg-background px-2 py-1 text-xs font-mono hover:bg-muted"
+                    title="点击删除"
+                  >
+                    ={value}
+                    <span className="text-muted-foreground">x</span>
+                  </button>
+                ))
+              )}
+            </div>
           </div>
           <div className="flex items-center gap-4 flex-wrap text-sm">
             <span className="text-muted-foreground">对以下请求类型生效：</span>

@@ -82,6 +82,8 @@ pub struct CacheOptimizerConfig {
     #[serde(default)]
     pub probe_bypass_max_input_tokens: Option<u64>,
     #[serde(default)]
+    pub probe_bypass_input_token_values: Vec<u64>,
+    #[serde(default)]
     pub probe_bypass_stream: bool,
     #[serde(default)]
     pub probe_bypass_non_stream: bool,
@@ -124,16 +126,40 @@ fn default_weight_read_write() -> u32 {
 }
 fn default_read_segments() -> Vec<CacheSegment> {
     vec![
-        CacheSegment { min: 90000, max: 110000, weight: 35 },
-        CacheSegment { min: 110001, max: 130000, weight: 45 },
-        CacheSegment { min: 130001, max: 145000, weight: 20 },
+        CacheSegment {
+            min: 90000,
+            max: 110000,
+            weight: 35,
+        },
+        CacheSegment {
+            min: 110001,
+            max: 130000,
+            weight: 45,
+        },
+        CacheSegment {
+            min: 130001,
+            max: 145000,
+            weight: 20,
+        },
     ]
 }
 fn default_write_segments() -> Vec<CacheSegment> {
     vec![
-        CacheSegment { min: 20, max: 200, weight: 55 },
-        CacheSegment { min: 201, max: 800, weight: 35 },
-        CacheSegment { min: 801, max: 3000, weight: 10 },
+        CacheSegment {
+            min: 20,
+            max: 200,
+            weight: 55,
+        },
+        CacheSegment {
+            min: 201,
+            max: 800,
+            weight: 35,
+        },
+        CacheSegment {
+            min: 801,
+            max: 3000,
+            weight: 10,
+        },
     ]
 }
 
@@ -162,6 +188,7 @@ impl Default for CacheOptimizerConfig {
             input_only_random_enabled: false,
             input_only_random_max: 0,
             probe_bypass_max_input_tokens: None,
+            probe_bypass_input_token_values: Vec::new(),
             probe_bypass_stream: false,
             probe_bypass_non_stream: false,
             probe_bypass_buffered: false,

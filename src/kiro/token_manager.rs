@@ -1115,7 +1115,11 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -1182,7 +1186,11 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -2119,7 +2127,10 @@ impl MultiTokenManager {
                 .iter()
                 .filter(|e| {
                     !e.disabled
-                        && !e.throttled_until.map(|t| t > throttled_now).unwrap_or(false)
+                        && !e
+                            .throttled_until
+                            .map(|t| t > throttled_now)
+                            .unwrap_or(false)
                 })
                 .count()
         }
@@ -2436,10 +2447,7 @@ impl MultiTokenManager {
     /// 复用 [`Self::get_usage_limits_for`] 的 token 准备流程：API Key 凭据直接用
     /// kiroApiKey；OAuth 凭据按需在 `refresh_lock` 内刷新并持久化。返回的凭据是
     /// 刷新后重新读取的最新快照，调用方据此构造请求。
-    async fn prepare_request_token(
-        &self,
-        id: u64,
-    ) -> anyhow::Result<(String, KiroCredentials)> {
+    async fn prepare_request_token(&self, id: u64) -> anyhow::Result<(String, KiroCredentials)> {
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -2791,8 +2799,11 @@ impl MultiTokenManager {
                 entry.credentials.proxy_password = v.filter(|s| !s.is_empty());
             }
             if let Some(g) = groups {
-                entry.credentials.groups =
-                    g.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                entry.credentials.groups = g
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
             }
             if let Some(v) = source_channel {
                 entry.credentials.source_channel =
@@ -3162,7 +3173,11 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    fn persist_account_throttle_config(&self, failover: bool, cooldown_secs: u64) -> anyhow::Result<()> {
+    fn persist_account_throttle_config(
+        &self,
+        failover: bool,
+        cooldown_secs: u64,
+    ) -> anyhow::Result<()> {
         use anyhow::Context;
 
         let config_path = match self.config.config_path() {
@@ -4158,7 +4173,10 @@ mod tests {
         assert!(group_matches(&[], None));
         assert!(group_matches(&["g1".to_string()], None));
         // 绑定分组时只匹配 groups 含该名的账号
-        assert!(group_matches(&["g1".to_string(), "g2".to_string()], Some("g1")));
+        assert!(group_matches(
+            &["g1".to_string(), "g2".to_string()],
+            Some("g1")
+        ));
         assert!(!group_matches(&["g2".to_string()], Some("g1")));
         assert!(!group_matches(&[], Some("g1")));
     }
@@ -4234,7 +4252,11 @@ mod tests {
         manager.report_success(1);
         manager.report_success(1);
         let pick = manager.select_next_credential(None, Some("g1"));
-        assert_eq!(pick.map(|(id, _)| id), Some(2), "balanced 应在 g1 内选 success_count 最小的 B");
+        assert_eq!(
+            pick.map(|(id, _)| id),
+            Some(2),
+            "balanced 应在 g1 内选 success_count 最小的 B"
+        );
         // g2 不受 g1 计数影响，仍只会选到 C(id3)
         let pick_g2 = manager.select_next_credential(None, Some("g2"));
         assert_eq!(pick_g2.map(|(id, _)| id), Some(3));
