@@ -234,18 +234,49 @@ fn should_emit_output_config(req: &MessagesRequest, model_id: &str) -> bool {
             .is_some_and(|t| t.thinking_type == "adaptive")
 }
 
+/// Upstream accepts only these `output_config.effort` values; anything else triggers a
+/// `400 REQUEST_BODY_INVALID` ("does not have a value in the enumeration"). The field is a
+/// free-form client string, so we must validate at this boundary rather than trust it.
+const VALID_EFFORTS: [&str; 4] = ["low", "medium", "high", "max"];
+
+/// Normalize a client-supplied effort to a canonical upstream value.
+///
+/// Trims and lowercases, then matches against [`VALID_EFFORTS`]. Returns `None` for empty or
+/// unrecognized values so the caller can drop the field and let upstream use its own default,
+/// instead of forwarding a value the upstream enum will reject.
+fn normalize_effort(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    VALID_EFFORTS
+        .iter()
+        .find(|valid| **valid == lowered)
+        .map(|valid| (*valid).to_string())
+}
+
 fn build_additional_model_request_fields(
     req: &MessagesRequest,
     model_id: &str,
 ) -> Option<AdditionalModelRequestFields> {
     let output_config = if should_emit_output_config(req, model_id) {
         req.output_config.as_ref().and_then(|oc| {
-            if oc.effort.trim().is_empty() {
-                return None;
+            match normalize_effort(&oc.effort) {
+                Some(effort) => Some(KiroOutputConfig { effort }),
+                None => {
+                    // Empty or out-of-enum effort: drop the field so upstream falls back to its
+                    // default rather than returning 400 REQUEST_BODY_INVALID.
+                    if !oc.effort.trim().is_empty() {
+                        tracing::warn!(
+                            model_id = %model_id,
+                            effort = %oc.effort,
+                            "dropping invalid output_config.effort (not in [low, medium, high, max])"
+                        );
+                    }
+                    None
+                }
             }
-            Some(KiroOutputConfig {
-                effort: oc.effort.clone(),
-            })
         })
     } else {
         if let Some(oc) = &req.output_config
@@ -1359,6 +1390,52 @@ mod tests {
             "high",
             "effort should be passed through for the supported model"
         );
+    }
+
+    #[test]
+    fn test_invalid_effort_is_dropped_not_forwarded() {
+        use super::super::types::OutputConfig;
+        // 下游传入不在 [low, medium, high, max] 枚举内的 effort（曾导致上游 400
+        // REQUEST_BODY_INVALID）：必须丢弃该字段而非透传。
+        for bad in ["minimal", "none", "xhigh", "9", "", "  "] {
+            let mut req =
+                minimal_adaptive_thinking_request_with_output_config("claude-opus-4-6-thinking");
+            req.output_config = Some(OutputConfig {
+                effort: bad.to_string(),
+            });
+            let result = convert_request(&req).unwrap();
+            assert!(
+                result.additional_model_request_fields.is_none(),
+                "invalid effort {bad:?} must be dropped, not forwarded to upstream"
+            );
+        }
+    }
+
+    #[test]
+    fn test_effort_is_normalized_case_insensitively() {
+        use super::super::types::OutputConfig;
+        // 合法但大小写/空白不规范的 effort：规范化为枚举内的标准值后透传。
+        for (input, expected) in [
+            ("HIGH", "high"),
+            (" Max ", "max"),
+            ("Low", "low"),
+            ("MEDIUM", "medium"),
+        ] {
+            let mut req =
+                minimal_adaptive_thinking_request_with_output_config("claude-opus-4-6-thinking");
+            req.output_config = Some(OutputConfig {
+                effort: input.to_string(),
+            });
+            let result = convert_request(&req).unwrap();
+            let fields = result
+                .additional_model_request_fields
+                .unwrap_or_else(|| panic!("valid effort {input:?} should be forwarded"));
+            assert_eq!(
+                fields.output_config.unwrap().effort,
+                expected,
+                "effort {input:?} should normalize to {expected:?}"
+            );
+        }
     }
 
     #[test]
