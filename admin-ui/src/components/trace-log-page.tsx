@@ -253,6 +253,66 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   )
 }
 
+function SimulatedTokenCell({ rec }: { rec: TraceRecord }) {
+  const hasSimulated =
+    rec.simulatedInputTokens != null ||
+    rec.simulatedOutputTokens != null ||
+    rec.simulatedCacheCreationTokens != null ||
+    rec.simulatedCacheReadTokens != null
+
+  if (!hasSimulated) {
+    return <span className="text-muted-foreground">—</span>
+  }
+
+  const input = rec.simulatedInputTokens ?? 0
+  const output = rec.simulatedOutputTokens ?? rec.outputTokens ?? 0
+  const cacheCreation = rec.simulatedCacheCreationTokens ?? 0
+  const cacheRead = rec.simulatedCacheReadTokens ?? 0
+  const total = input + output + cacheCreation + cacheRead
+  const rows: Array<[string, number]> = [
+    ['模拟输入 Token', input],
+    ['模拟输出 Token', output],
+    ['模拟缓存创建 Token', cacheCreation],
+    ['模拟缓存读取 Token', cacheRead],
+  ]
+
+  return (
+    <TooltipProvider delayDuration={150}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex cursor-default items-center gap-1 border-b border-dotted border-muted-foreground/40 font-mono tabular-nums">
+            <span className="text-cyan-600 dark:text-cyan-400">
+              ↓{formatTokens(input + cacheCreation + cacheRead)}
+            </span>
+            <span className="text-fuchsia-600 dark:text-fuchsia-400">
+              ↑{formatTokens(output)}
+            </span>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent className="p-0">
+          <div className="min-w-[190px] px-3 py-2">
+            <div className="mb-1.5 text-[13px] font-semibold">模拟返回 Token</div>
+            <div className="space-y-1 text-[12px]">
+              {rows.map(([label, val]) => (
+                <div key={label} className="flex items-center justify-between gap-6">
+                  <span className="text-muted-foreground">{label}</span>
+                  <span className="font-mono tabular-nums">{formatTokenFull(val)}</span>
+                </div>
+              ))}
+              <div className="mt-1 flex items-center justify-between gap-6 border-t border-border/50 pt-1">
+                <span className="font-medium">模拟总 Token</span>
+                <span className="font-mono font-semibold tabular-nums">
+                  {formatTokenFull(total)}
+                </span>
+              </div>
+            </div>
+          </div>
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  )
+}
+
 function TraceRow({ rec }: { rec: TraceRecord }) {
   const [open, setOpen] = useState(false)
   const errStyle = rec.errorType ? outcomeStyle(rec.errorType) : null
@@ -285,6 +345,9 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
         <TraceCredentialCell rec={rec} />
         <td className="py-2.5 pr-3 text-[12px] tabular-nums">
           <TokenCell rec={rec} />
+        </td>
+        <td className="py-2.5 pr-3 text-[12px] tabular-nums">
+          <SimulatedTokenCell rec={rec} />
         </td>
         <td className="py-2.5 pr-3 text-[13px] tabular-nums">
           {rec.credits != null && rec.credits > 0 ? rec.credits.toFixed(4) : '—'}
@@ -587,7 +650,7 @@ export function TraceLogPage() {
             </div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1080px] text-left">
+              <table className="w-full min-w-[1160px] text-left">
                 <thead>
                   <tr className="whitespace-nowrap border-b border-border/60 text-[12px] uppercase tracking-wider text-muted-foreground">
                     <th className="py-2 pl-3 pr-2 font-medium"></th>
@@ -597,6 +660,7 @@ export function TraceLogPage() {
                     <th className="py-2 pr-3 font-medium">状态</th>
                     <th className="py-2 pr-3 font-medium">最终凭据</th>
                     <th className="py-2 pr-3 font-medium">Token</th>
+                    <th className="py-2 pr-3 font-medium">模拟TOKEN</th>
                     <th className="py-2 pr-3 font-medium">费用</th>
                     <th className="py-2 pr-3 font-medium">首Token</th>
                     <th className="py-2 pr-3 font-medium">错误类型</th>
