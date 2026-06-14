@@ -26,6 +26,7 @@ use super::{
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
+use crate::model::config::CacheOptimizerConfig;
 
 // Path 元组提取：(credential_id, session_id)
 type CredSessionPath = (u64, String);
@@ -35,6 +36,23 @@ type CredSessionPath = (u64, String);
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_all_credentials();
     Json(response)
+}
+
+/// GET /api/admin/cache-optimizer
+pub async fn get_cache_optimizer(State(state): State<AdminState>) -> impl IntoResponse {
+    let config = state.service.get_cache_optimizer();
+    Json(serde_json::json!({ "config": config }))
+}
+
+/// PUT /api/admin/cache-optimizer
+pub async fn set_cache_optimizer(
+    State(state): State<AdminState>,
+    Json(payload): Json<CacheOptimizerConfig>,
+) -> impl IntoResponse {
+    match state.service.set_cache_optimizer(payload) {
+        Ok(config) => Json(serde_json::json!({ "config": config })).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// GET /api/admin/credentials/export

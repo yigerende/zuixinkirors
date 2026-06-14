@@ -1,0 +1,1137 @@
+use crate::model::config::{CacheOptimizerConfig, CacheSegment};
+
+#[derive(Clone, Copy)]
+pub(crate) enum ResponsePath {
+    Stream,
+    NonStream,
+    Buffered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SimulatedUsage {
+    pub input_tokens: i32,
+    pub output_tokens: i32,
+    pub cache_creation_tokens: i32,
+    pub cache_read_tokens: i32,
+}
+
+/// 只计算"写给下游 response/log 展示"的模拟 usage。
+///
+/// 这里不回写 CacheMeter、不影响 token_manager、不改变 provider 调用与内部真实统计。
+pub(crate) fn rewrite_usage_for_response(
+    input_tokens: i32,
+    output_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
+    config: &CacheOptimizerConfig,
+    path: ResponsePath,
+) -> SimulatedUsage {
+    if config.input_only_random_enabled && config.input_only_random_max > 0 {
+        return SimulatedUsage {
+            input_tokens: random_in_range(1, config.input_only_random_max as u64),
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        };
+    }
+
+    if !config.enabled || !path_enabled(config, path) {
+        return SimulatedUsage {
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        };
+    }
+
+    let total_input_tokens = input_tokens
+        .saturating_add(cache_creation_tokens)
+        .saturating_add(cache_read_tokens);
+
+    if should_bypass_for_probe(config, path, total_input_tokens) {
+        return SimulatedUsage {
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        };
+    }
+
+    let (new_read, new_creation) =
+        rewrite_cache_usage(cache_read_tokens, cache_creation_tokens, config, path);
+    let (new_read, new_creation, _, _) = apply_input_scale(
+        new_read,
+        new_creation,
+        new_creation,
+        0,
+        total_input_tokens,
+        config,
+    );
+    let input_tokens = rewrite_input_tokens(config, path).unwrap_or(input_tokens);
+    SimulatedUsage {
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens: new_creation,
+        cache_read_tokens: new_read,
+    }
+}
+
+fn path_enabled(config: &CacheOptimizerConfig, path: ResponsePath) -> bool {
+    match path {
+        ResponsePath::Stream => config.enabled_stream,
+        ResponsePath::NonStream => config.enabled_non_stream,
+        ResponsePath::Buffered => config.enabled_buffered,
+    }
+}
+
+/// 探活豁免判断：请求输入过小（如渠道探活）时，应跳过模拟缓存改写、原样真实返回。
+///
+/// 条件（全部满足才豁免）：
+/// 1. 配置了阈值 `probe_bypass_max_input_tokens`（None=不启用）
+/// 2. 当前响应路径在豁免开关里被勾选
+/// 3. 请求输入 token（估算值，非上游返回）≤ 阈值
+///
+/// `request_input_tokens` 必须是「请求进来时估算的输入」。
+#[allow(dead_code)]
+pub(crate) fn should_bypass_for_probe(
+    config: &CacheOptimizerConfig,
+    path: ResponsePath,
+    request_input_tokens: i32,
+) -> bool {
+    let Some(threshold) = config.probe_bypass_max_input_tokens else {
+        return false;
+    };
+    let path_enabled = match path {
+        ResponsePath::Stream => config.probe_bypass_stream,
+        ResponsePath::NonStream => config.probe_bypass_non_stream,
+        ResponsePath::Buffered => config.probe_bypass_buffered,
+    };
+    if !path_enabled {
+        return false;
+    }
+    request_input_tokens >= 0 && (request_input_tokens as u64) <= threshold
+}
+
+/// 输入放大：按上游真实输入分档，对（模拟改写后的）读/写缓存乘倍率。
+///
+/// - 仅在 `enabled && input_scale_enabled` 时生效
+/// - 用 `final_input_tokens`（上游真实输入）落档
+/// - 只对 >0 的读/写值乘倍率（=0 保持 0，不破坏只读/只写形态）
+/// - 乘后受 input_scale_max_read / input_scale_max_write 封顶（None=不封顶）
+/// - 5m/1h 跟随改写后的写总值同步
+///
+/// 入参/返回均为 `(read, creation_total, creation_5m, creation_1h)`。
+#[allow(dead_code)]
+pub(crate) fn apply_input_scale(
+    read: i32,
+    creation: i32,
+    creation_5m: i32,
+    creation_1h: i32,
+    final_input_tokens: i32,
+    config: &CacheOptimizerConfig,
+) -> (i32, i32, i32, i32) {
+    if !config.enabled || !config.input_scale_enabled {
+        return (read, creation, creation_5m, creation_1h);
+    }
+    // 找真实输入落在哪个分档
+    let input = final_input_tokens.max(0) as u64;
+    let Some(seg) = config
+        .input_scale_segments
+        .iter()
+        .find(|s| input >= s.min && input <= s.max)
+    else {
+        return (read, creation, creation_5m, creation_1h);
+    };
+
+    // 乘倍率（仅对 >0 的值），再按独立上限封顶
+    let new_read = if read > 0 {
+        scale_and_cap(read, seg.read_multiplier, config.input_scale_max_read)
+    } else {
+        read
+    };
+    let new_creation = if creation > 0 {
+        scale_and_cap(creation, seg.write_multiplier, config.input_scale_max_write)
+    } else {
+        creation
+    };
+
+    // 写总值变化时，5m/1h 同步（归整到 5m，清 1h）
+    if new_creation != creation {
+        (new_read, new_creation, new_creation, 0)
+    } else {
+        (new_read, new_creation, creation_5m, creation_1h)
+    }
+}
+
+/// 乘倍率并按上限封顶（倍率支持 1 位小数；None 上限=不封顶）。
+fn scale_and_cap(value: i32, multiplier: f64, max: Option<u64>) -> i32 {
+    let scaled = ((value as f64) * multiplier).round();
+    let scaled = if scaled < 0.0 { 0.0 } else { scaled };
+    let mut result = scaled as i64;
+    if let Some(cap) = max {
+        result = result.min(cap as i64);
+    }
+    result.min(i32::MAX as i64) as i32
+}
+
+pub(crate) fn rewrite_cache_usage(
+    raw_read: i32,
+    raw_write: i32,
+    config: &CacheOptimizerConfig,
+    path: ResponsePath,
+) -> (i32, i32) {
+    if !config.enabled {
+        return (raw_read, raw_write);
+    }
+
+    let path_enabled = match path {
+        ResponsePath::Stream => config.enabled_stream,
+        ResponsePath::NonStream => config.enabled_non_stream,
+        ResponsePath::Buffered => config.enabled_buffered,
+    };
+    if !path_enabled {
+        return (raw_read, raw_write);
+    }
+
+    if config.rewrite_only_when_present && raw_read == 0 && raw_write == 0 {
+        return (0, 0);
+    }
+
+    match config.mode.as_str() {
+        "passthrough" => (raw_read, raw_write),
+        "zero" => (0, 0),
+        "cap" => (
+            raw_read.min(config.read_max as i32),
+            raw_write.min(config.write_max as i32),
+        ),
+        "random" => (
+            random_in_range(config.read_min, config.read_max),
+            random_in_range(config.write_min, config.write_max),
+        ),
+        "weighted" => weighted_rewrite(raw_read, raw_write, config),
+        _ => (raw_read, raw_write),
+    }
+}
+
+/// 改写缓存读写，并同步 5m/1h 拆分。
+///
+/// 在 `rewrite_cache_usage` 基础上，把 cache_creation 的 5m/1h 拆分同步到改写后的
+/// 总写值（归整到 5m，清空 1h），避免下游读到「总 cache_creation 与 5m+1h 拆分不一致」
+/// 的数据。下游 new-api 的 Claude 计费实际以 5m/1h 拆分值结算，若拆分值不同步，
+/// 改写会被架空。
+///
+/// 入参/返回均为 `(read, creation_total, creation_5m, creation_1h)`。
+#[allow(dead_code)]
+pub(crate) fn rewrite_cache_usage_with_split(
+    raw_read: i32,
+    raw_creation: i32,
+    raw_5m: i32,
+    raw_1h: i32,
+    config: &CacheOptimizerConfig,
+    path: ResponsePath,
+) -> (i32, i32, i32, i32) {
+    let (new_read, new_creation) = rewrite_cache_usage(raw_read, raw_creation, config, path);
+    if new_creation == raw_creation {
+        // 总写值未变，拆分保持原样。
+        return (new_read, new_creation, raw_5m, raw_1h);
+    }
+    // 总写值被改写：把拆分归整到 5m，清空 1h，保证 5m+1h == 总值。
+    (new_read, new_creation, new_creation, 0)
+}
+
+/// 计算改写后的 input_tokens。
+///
+/// 仅当模拟缓存开启、当前路径开启、且 `input_random_max > 0` 时，
+/// 返回 `Some(随机 [1, input_random_max])`；否则返回 `None`（表示不改写，沿用原值）。
+///
+/// 下限取 1 而非 0：下游 new-api 解析 Claude 流式 usage 时，message_delta 的
+/// input_tokens 只有在 `> 0` 才会覆盖 message_start 里的真实值。若这里返回 0，
+/// new-api 会丢弃该 0 并回退使用 message_start 的真实大值，导致偶发的超大 input 计费。
+pub(crate) fn rewrite_input_tokens(
+    config: &CacheOptimizerConfig,
+    path: ResponsePath,
+) -> Option<i32> {
+    if !config.enabled {
+        return None;
+    }
+    let path_enabled = match path {
+        ResponsePath::Stream => config.enabled_stream,
+        ResponsePath::NonStream => config.enabled_non_stream,
+        ResponsePath::Buffered => config.enabled_buffered,
+    };
+    if !path_enabled || config.input_random_max == 0 {
+        return None;
+    }
+    Some(random_in_range(1, config.input_random_max as u64))
+}
+
+fn weighted_rewrite(raw_read: i32, raw_write: i32, config: &CacheOptimizerConfig) -> (i32, i32) {
+    let total_weight = config.weight_read_only
+        + config.weight_write_only
+        + config.weight_read_write
+        + config.weight_none;
+
+    if total_weight == 0 {
+        return (0, 0);
+    }
+
+    let shape = weighted_pick(&[
+        ("readOnly", config.weight_read_only),
+        ("writeOnly", config.weight_write_only),
+        ("readWrite", config.weight_read_write),
+        ("none", config.weight_none),
+    ]);
+
+    // If rewrite_only_when_present, constrain shapes based on upstream
+    let shape = if config.rewrite_only_when_present {
+        match (raw_read > 0, raw_write > 0) {
+            (true, false) => {
+                if shape == "writeOnly" || shape == "readWrite" {
+                    "readOnly"
+                } else {
+                    shape
+                }
+            }
+            (false, true) => {
+                if shape == "readOnly" || shape == "readWrite" {
+                    "writeOnly"
+                } else {
+                    shape
+                }
+            }
+            (false, false) => "none",
+            _ => shape,
+        }
+    } else {
+        shape
+    };
+
+    let read_val = if config.use_segment_weights {
+        random_from_segments(&config.read_segments, config.read_min, config.read_max)
+    } else {
+        random_in_range(config.read_min, config.read_max)
+    };
+
+    let write_val = if config.use_segment_weights {
+        random_from_segments(&config.write_segments, config.write_min, config.write_max)
+    } else {
+        random_in_range(config.write_min, config.write_max)
+    };
+
+    match shape {
+        "readOnly" => (read_val, 0),
+        "writeOnly" => (0, write_val),
+        "readWrite" => (read_val, write_val),
+        _ => (0, 0),
+    }
+}
+
+fn random_in_range(min: u64, max: u64) -> i32 {
+    if min >= max {
+        return min as i32;
+    }
+    fastrand::u64(min..=max) as i32
+}
+
+fn random_from_segments(segments: &[CacheSegment], fallback_min: u64, fallback_max: u64) -> i32 {
+    if segments.is_empty() {
+        return random_in_range(fallback_min, fallback_max);
+    }
+
+    let total: u32 = segments.iter().map(|s| s.weight).sum();
+    if total == 0 {
+        return random_in_range(fallback_min, fallback_max);
+    }
+
+    let mut roll = fastrand::u32(0..total);
+    for seg in segments {
+        if roll < seg.weight {
+            return random_in_range(seg.min, seg.max);
+        }
+        roll -= seg.weight;
+    }
+
+    random_in_range(fallback_min, fallback_max)
+}
+
+fn weighted_pick<'a>(entries: &[(&'a str, u32)]) -> &'a str {
+    let total: u32 = entries.iter().map(|(_, w)| *w).sum();
+    if total == 0 {
+        return "none";
+    }
+    let mut roll = fastrand::u32(0..total);
+    for (name, weight) in entries {
+        if roll < *weight {
+            return name;
+        }
+        roll -= weight;
+    }
+    entries.last().map(|(n, _)| *n).unwrap_or("none")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_config(mode: &str, enabled: bool) -> CacheOptimizerConfig {
+        CacheOptimizerConfig {
+            enabled,
+            enabled_stream: true,
+            enabled_non_stream: true,
+            enabled_buffered: true,
+            mode: mode.to_string(),
+            read_min: 5000,
+            read_max: 10000,
+            write_min: 100,
+            write_max: 500,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn disabled_returns_original() {
+        let config = make_config("weighted", false);
+        let (r, w) = rewrite_cache_usage(1000, 200, &config, ResponsePath::Stream);
+        assert_eq!((r, w), (1000, 200));
+    }
+
+    #[test]
+    fn path_disabled_returns_original() {
+        let mut config = make_config("zero", true);
+        config.enabled_stream = false;
+        let (r, w) = rewrite_cache_usage(1000, 200, &config, ResponsePath::Stream);
+        assert_eq!((r, w), (1000, 200));
+        // But NonStream should work
+        let (r2, w2) = rewrite_cache_usage(1000, 200, &config, ResponsePath::NonStream);
+        assert_eq!((r2, w2), (0, 0));
+    }
+
+    #[test]
+    fn zero_mode() {
+        let config = make_config("zero", true);
+        let (r, w) = rewrite_cache_usage(9999, 8888, &config, ResponsePath::NonStream);
+        assert_eq!((r, w), (0, 0));
+    }
+
+    #[test]
+    fn passthrough_mode() {
+        let config = make_config("passthrough", true);
+        let (r, w) = rewrite_cache_usage(1234, 567, &config, ResponsePath::Buffered);
+        assert_eq!((r, w), (1234, 567));
+    }
+
+    #[test]
+    fn cap_mode() {
+        let mut config = make_config("cap", true);
+        config.read_max = 500;
+        config.write_max = 100;
+        let (r, w) = rewrite_cache_usage(1000, 200, &config, ResponsePath::Stream);
+        assert_eq!((r, w), (500, 100));
+        // Under cap keeps original
+        let (r2, w2) = rewrite_cache_usage(300, 50, &config, ResponsePath::Stream);
+        assert_eq!((r2, w2), (300, 50));
+    }
+
+    #[test]
+    fn random_mode_within_range() {
+        let config = make_config("random", true);
+        for _ in 0..100 {
+            let (r, w) = rewrite_cache_usage(99999, 99999, &config, ResponsePath::Stream);
+            assert!(r >= 5000 && r <= 10000, "read {r} out of range");
+            assert!(w >= 100 && w <= 500, "write {w} out of range");
+        }
+    }
+
+    #[test]
+    fn rewrite_only_when_present_skips_zero_input() {
+        let mut config = make_config("random", true);
+        config.rewrite_only_when_present = true;
+        let (r, w) = rewrite_cache_usage(0, 0, &config, ResponsePath::Stream);
+        assert_eq!((r, w), (0, 0));
+    }
+
+    #[test]
+    fn weighted_mode_produces_valid_shapes() {
+        let mut config = make_config("weighted", true);
+        config.weight_read_only = 100;
+        config.weight_write_only = 0;
+        config.weight_read_write = 0;
+        config.weight_none = 0;
+        config.rewrite_only_when_present = false;
+        for _ in 0..50 {
+            let (r, w) = rewrite_cache_usage(1000, 1000, &config, ResponsePath::Stream);
+            assert!(r >= 5000 && r <= 10000);
+            assert_eq!(w, 0); // readOnly shape => write is 0
+        }
+    }
+
+    #[test]
+    fn rewrite_input_tokens_never_returns_zero() {
+        // 下游 new-api 在 message_delta 的 input_tokens 为 0 时会丢弃并回退到
+        // message_start 的真实大值，因此改写后的 input 必须 >= 1。
+        let mut config = make_config("weighted", true);
+        config.input_random_max = 10;
+        for _ in 0..500 {
+            let v = rewrite_input_tokens(&config, ResponsePath::Stream)
+                .expect("input_random_max > 0 should rewrite");
+            assert!(v >= 1 && v <= 10, "input {v} out of [1,10]");
+        }
+    }
+
+    #[test]
+    fn rewrite_input_tokens_disabled_when_max_zero() {
+        let mut config = make_config("weighted", true);
+        config.input_random_max = 0;
+        assert_eq!(rewrite_input_tokens(&config, ResponsePath::Stream), None);
+    }
+
+    #[test]
+    fn response_rewrite_probe_bypass_keeps_original_usage() {
+        let mut config = make_config("zero", true);
+        config.probe_bypass_max_input_tokens = Some(1_500);
+        config.probe_bypass_non_stream = true;
+        config.input_random_max = 10;
+
+        let usage = rewrite_usage_for_response(
+            100,
+            20,
+            300,
+            400,
+            &config,
+            ResponsePath::NonStream,
+        );
+
+        assert_eq!(
+            usage,
+            SimulatedUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_creation_tokens: 300,
+                cache_read_tokens: 400,
+            }
+        );
+    }
+
+    #[test]
+    fn response_rewrite_disabled_keeps_original_even_if_sub_rules_enabled() {
+        let mut config = make_config("zero", false);
+        config.input_random_max = 10;
+        config.input_scale_enabled = true;
+        config.input_scale_segments = vec![crate::model::config::InputScaleSegment {
+            min: 0,
+            max: 10_000,
+            read_multiplier: 9.0,
+            write_multiplier: 9.0,
+        }];
+
+        let usage = rewrite_usage_for_response(
+            100,
+            20,
+            300,
+            400,
+            &config,
+            ResponsePath::Stream,
+        );
+
+        assert_eq!(
+            usage,
+            SimulatedUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_creation_tokens: 300,
+                cache_read_tokens: 400,
+            }
+        );
+    }
+
+    #[test]
+    fn response_rewrite_path_disabled_keeps_original_even_if_sub_rules_enabled() {
+        let mut config = make_config("zero", true);
+        config.enabled_stream = false;
+        config.input_random_max = 10;
+        config.input_scale_enabled = true;
+        config.input_scale_segments = vec![crate::model::config::InputScaleSegment {
+            min: 0,
+            max: 10_000,
+            read_multiplier: 9.0,
+            write_multiplier: 9.0,
+        }];
+
+        let usage = rewrite_usage_for_response(
+            100,
+            20,
+            300,
+            400,
+            &config,
+            ResponsePath::Stream,
+        );
+
+        assert_eq!(
+            usage,
+            SimulatedUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_creation_tokens: 300,
+                cache_read_tokens: 400,
+            }
+        );
+    }
+
+    #[test]
+    fn response_rewrite_applies_input_scale_to_simulated_cache_usage() {
+        let mut config = make_config("cap", true);
+        config.read_max = 2_000;
+        config.write_max = 1_000;
+        config.input_scale_enabled = true;
+        config.input_scale_segments = vec![crate::model::config::InputScaleSegment {
+            min: 0,
+            max: 10_000,
+            read_multiplier: 2.0,
+            write_multiplier: 3.0,
+        }];
+
+        let usage = rewrite_usage_for_response(
+            100,
+            20,
+            500,
+            800,
+            &config,
+            ResponsePath::Stream,
+        );
+
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cache_creation_tokens, 1_500);
+        assert_eq!(usage.cache_read_tokens, 1_600);
+    }
+
+    #[test]
+    fn response_rewrite_input_random_changes_only_input_when_cache_passthrough() {
+        let mut config = make_config("passthrough", true);
+        config.input_random_max = 5;
+
+        for _ in 0..100 {
+            let usage = rewrite_usage_for_response(
+                100,
+                20,
+                300,
+                400,
+                &config,
+                ResponsePath::Buffered,
+            );
+
+            assert!(
+                (1..=5).contains(&usage.input_tokens),
+                "input {} out of [1,5]",
+                usage.input_tokens
+            );
+            assert_eq!(usage.output_tokens, 20);
+            assert_eq!(usage.cache_creation_tokens, 300);
+            assert_eq!(usage.cache_read_tokens, 400);
+        }
+    }
+
+    #[test]
+    fn input_only_random_overrides_all_other_simulation_and_keeps_cache_usage() {
+        let mut config = make_config("zero", true);
+        config.input_only_random_enabled = true;
+        config.input_only_random_max = 7;
+        config.input_random_max = 99;
+        config.probe_bypass_max_input_tokens = Some(10_000);
+        config.probe_bypass_stream = true;
+        config.input_scale_enabled = true;
+        config.input_scale_segments = vec![crate::model::config::InputScaleSegment {
+            min: 0,
+            max: 10_000,
+            read_multiplier: 9.0,
+            write_multiplier: 9.0,
+        }];
+
+        for _ in 0..100 {
+            let usage = rewrite_usage_for_response(
+                100,
+                20,
+                300,
+                400,
+                &config,
+                ResponsePath::Stream,
+            );
+
+            assert!(
+                (1..=7).contains(&usage.input_tokens),
+                "input {} out of [1,7]",
+                usage.input_tokens
+            );
+            assert_eq!(usage.output_tokens, 20);
+            assert_eq!(usage.cache_creation_tokens, 300);
+            assert_eq!(usage.cache_read_tokens, 400);
+        }
+    }
+
+    #[test]
+    fn input_only_random_works_even_when_main_and_path_switches_are_disabled() {
+        let mut config = make_config("zero", false);
+        config.enabled_stream = false;
+        config.input_only_random_enabled = true;
+        config.input_only_random_max = 9;
+        config.input_random_max = 99;
+        config.probe_bypass_max_input_tokens = Some(10_000);
+        config.probe_bypass_stream = true;
+        config.input_scale_enabled = true;
+        config.input_scale_segments = vec![crate::model::config::InputScaleSegment {
+            min: 0,
+            max: 10_000,
+            read_multiplier: 9.0,
+            write_multiplier: 9.0,
+        }];
+
+        for _ in 0..100 {
+            let usage = rewrite_usage_for_response(
+                100,
+                20,
+                300,
+                400,
+                &config,
+                ResponsePath::Stream,
+            );
+
+            assert!(
+                (1..=9).contains(&usage.input_tokens),
+                "input {} out of [1,9]",
+                usage.input_tokens
+            );
+            assert_eq!(usage.output_tokens, 20);
+            assert_eq!(usage.cache_creation_tokens, 300);
+            assert_eq!(usage.cache_read_tokens, 400);
+        }
+    }
+
+    fn screenshot_config() -> CacheOptimizerConfig {
+        CacheOptimizerConfig {
+            enabled: true,
+            enabled_stream: true,
+            enabled_non_stream: true,
+            enabled_buffered: false,
+            mode: "weighted".to_string(),
+            read_min: 15_000,
+            read_max: 165_000,
+            write_min: 5,
+            write_max: 22_000,
+            input_random_max: 2_000,
+            input_only_random_enabled: false,
+            input_only_random_max: 0,
+            weight_read_only: 12,
+            weight_write_only: 8,
+            weight_read_write: 90,
+            weight_none: 0,
+            use_segment_weights: true,
+            read_segments: vec![
+                CacheSegment {
+                    min: 15_000,
+                    max: 70_000,
+                    weight: 18,
+                },
+                CacheSegment {
+                    min: 70_001,
+                    max: 110_000,
+                    weight: 42,
+                },
+                CacheSegment {
+                    min: 110_001,
+                    max: 165_000,
+                    weight: 40,
+                },
+            ],
+            write_segments: vec![
+                CacheSegment {
+                    min: 5,
+                    max: 800,
+                    weight: 52,
+                },
+                CacheSegment {
+                    min: 801,
+                    max: 6500,
+                    weight: 44,
+                },
+                CacheSegment {
+                    min: 6501,
+                    max: 22_000,
+                    weight: 4,
+                },
+            ],
+            rewrite_only_when_present: false,
+            keep_raw_breakdown: true,
+            probe_bypass_max_input_tokens: Some(1_000),
+            probe_bypass_stream: true,
+            probe_bypass_non_stream: true,
+            probe_bypass_buffered: false,
+            input_scale_enabled: true,
+            input_scale_max_read: None,
+            input_scale_max_write: None,
+            input_scale_segments: vec![
+                crate::model::config::InputScaleSegment {
+                    min: 165_001,
+                    max: 300_000,
+                    read_multiplier: 1.3,
+                    write_multiplier: 1.0,
+                },
+                crate::model::config::InputScaleSegment {
+                    min: 300_001,
+                    max: 500_000,
+                    read_multiplier: 1.5,
+                    write_multiplier: 1.0,
+                },
+                crate::model::config::InputScaleSegment {
+                    min: 500_001,
+                    max: 750_000,
+                    read_multiplier: 1.9,
+                    write_multiplier: 1.0,
+                },
+                crate::model::config::InputScaleSegment {
+                    min: 750_001,
+                    max: 1_000_000,
+                    read_multiplier: 2.5,
+                    write_multiplier: 1.0,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn screenshot_config_probe_bypass_keeps_small_requests_original() {
+        let config = screenshot_config();
+        let usage = rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream);
+        assert_eq!(
+            usage,
+            SimulatedUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_creation_tokens: 300,
+                cache_read_tokens: 400,
+            }
+        );
+    }
+
+    #[test]
+    fn screenshot_config_buffered_path_is_disabled() {
+        let config = screenshot_config();
+        let usage = rewrite_usage_for_response(
+            10_000,
+            20,
+            300,
+            400,
+            &config,
+            ResponsePath::Buffered,
+        );
+        assert_eq!(
+            usage,
+            SimulatedUsage {
+                input_tokens: 10_000,
+                output_tokens: 20,
+                cache_creation_tokens: 300,
+                cache_read_tokens: 400,
+            }
+        );
+    }
+
+    #[test]
+    fn screenshot_config_rewrites_non_stream_usage_in_expected_ranges() {
+        let config = screenshot_config();
+        for _ in 0..1000 {
+            let usage = rewrite_usage_for_response(
+                200_000,
+                20,
+                480_000,
+                150_000,
+                &config,
+                ResponsePath::NonStream,
+            );
+            assert!(
+                (1..=2_000).contains(&usage.input_tokens),
+                "input {} out of [1,2000]",
+                usage.input_tokens
+            );
+            assert_eq!(usage.output_tokens, 20);
+            assert!(
+                usage.cache_creation_tokens == 0
+                    || (5..=22_000).contains(&usage.cache_creation_tokens),
+                "creation {} out of expected range",
+                usage.cache_creation_tokens
+            );
+            assert!(
+                usage.cache_read_tokens == 0
+                    || (37_500..=412_500).contains(&usage.cache_read_tokens),
+                "read {} out of scaled expected range",
+                usage.cache_read_tokens
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_with_split_syncs_5m_1h_when_total_changed() {
+        // cap 模式：写上限 22000，喂 480000 + 拆分(480000,0)。
+        let mut config = make_config("cap", true);
+        config.read_max = 165_000;
+        config.write_max = 22_000;
+        let (read, creation, c5m, c1h) = rewrite_cache_usage_with_split(
+            150_000,
+            480_000,
+            480_000,
+            0,
+            &config,
+            ResponsePath::Buffered,
+        );
+        assert_eq!(read, 150_000); // < 165000，cap 不变
+        assert_eq!(creation, 22_000); // cap 到上限
+        // 总值变了 → 5m/1h 必须同步，5m+1h == 总值
+        assert_eq!(c5m, 22_000);
+        assert_eq!(c1h, 0);
+        assert_eq!(c5m + c1h, creation);
+    }
+
+    #[test]
+    fn rewrite_with_split_keeps_5m_1h_when_total_unchanged() {
+        // cap 模式但总值未超上限 → 拆分保持原样。
+        let mut config = make_config("cap", true);
+        config.write_max = 100_000;
+        let (_read, creation, c5m, c1h) =
+            rewrite_cache_usage_with_split(0, 8000, 5000, 3000, &config, ResponsePath::NonStream);
+        assert_eq!(creation, 8000); // 8000 < 100000，不变
+        assert_eq!(c5m, 5000); // 原样保留
+        assert_eq!(c1h, 3000);
+    }
+
+    #[test]
+    fn disabled_is_identity_for_all_fields() {
+        // 关闭模拟缓存：四个字段必须原样返回，不被任何模式/上限影响。
+        let mut config = make_config("zero", false); // 即便 mode=zero，关闭时也不应清零
+        config.read_max = 1;
+        config.write_max = 1;
+        config.input_random_max = 99;
+        for path in [
+            ResponsePath::Stream,
+            ResponsePath::NonStream,
+            ResponsePath::Buffered,
+        ] {
+            let (r, c, m5, h1) =
+                rewrite_cache_usage_with_split(150_000, 480_000, 300_000, 180_000, &config, path);
+            assert_eq!(
+                (r, c, m5, h1),
+                (150_000, 480_000, 300_000, 180_000),
+                "关闭时四字段必须原样返回"
+            );
+            assert_eq!(
+                rewrite_input_tokens(&config, path),
+                None,
+                "关闭时 input 不改写"
+            );
+        }
+    }
+
+    #[test]
+    fn passthrough_mode_is_identity_when_enabled() {
+        // 开启但 mode=passthrough：等同关闭，原样返回。
+        let config = make_config("passthrough", true);
+        let (r, c, m5, h1) = rewrite_cache_usage_with_split(
+            150_000,
+            480_000,
+            300_000,
+            180_000,
+            &config,
+            ResponsePath::Buffered,
+        );
+        assert_eq!((r, c, m5, h1), (150_000, 480_000, 300_000, 180_000));
+    }
+
+    /// 贴近正式环境的 weighted 配置（含读写分段权重）。
+    fn prod_weighted_config() -> CacheOptimizerConfig {
+        CacheOptimizerConfig {
+            enabled: true,
+            enabled_stream: true,
+            enabled_non_stream: true,
+            enabled_buffered: true,
+            mode: "weighted".to_string(),
+            read_min: 15_000,
+            read_max: 165_000,
+            write_min: 5,
+            write_max: 22_000,
+            weight_read_only: 12,
+            weight_write_only: 8,
+            weight_read_write: 90,
+            weight_none: 0,
+            rewrite_only_when_present: true,
+            use_segment_weights: true,
+            read_segments: vec![
+                CacheSegment {
+                    min: 15_000,
+                    max: 70_000,
+                    weight: 18,
+                },
+                CacheSegment {
+                    min: 70_001,
+                    max: 110_000,
+                    weight: 52,
+                },
+                CacheSegment {
+                    min: 110_001,
+                    max: 165_000,
+                    weight: 30,
+                },
+            ],
+            write_segments: vec![
+                CacheSegment {
+                    min: 5,
+                    max: 800,
+                    weight: 72,
+                },
+                CacheSegment {
+                    min: 801,
+                    max: 6500,
+                    weight: 24,
+                },
+                CacheSegment {
+                    min: 6501,
+                    max: 22_000,
+                    weight: 4,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn weighted_with_split_stays_in_range_and_syncs() {
+        // 上游有读有写（48万写 / 15万读），weighted 模式跑多次：
+        // 读/写要么 0、要么落在配置范围内；5m+1h 必须等于改写后的写总值。
+        let config = prod_weighted_config();
+        for _ in 0..1000 {
+            let (read, creation, c5m, c1h) = rewrite_cache_usage_with_split(
+                150_000,
+                480_000,
+                480_000,
+                0,
+                &config,
+                ResponsePath::Buffered,
+            );
+            // 写：要么 0（writeOnly 形态不会发生，因为上游有读有写 + readWrite 权重高，
+            // 但 readOnly 形态会让写=0），要么落在 [5, 22000]
+            assert!(
+                creation == 0 || (5..=22_000).contains(&creation),
+                "creation {creation} 超出 [5,22000]"
+            );
+            // 读：要么 0（writeOnly 形态），要么落在 [15000, 165000]
+            assert!(
+                read == 0 || (15_000..=165_000).contains(&read),
+                "read {read} 超出 [15000,165000]"
+            );
+            // 关键：改写后总写值绝不应是上游真实的 480000
+            assert_ne!(creation, 480_000, "写未被改写，仍是上游真实值");
+            // 5m/1h 同步：改写后(总值变了)5m+1h == creation
+            assert_eq!(c5m + c1h, creation, "5m+1h 必须等于写总值");
+        }
+    }
+
+    // ===== 探活豁免测试 =====
+    #[test]
+    fn probe_bypass_disabled_when_no_threshold() {
+        let config = make_config("weighted", true); // 默认无 probe_bypass_max_input_tokens
+        assert!(!should_bypass_for_probe(
+            &config,
+            ResponsePath::NonStream,
+            5
+        ));
+    }
+
+    #[test]
+    fn probe_bypass_respects_threshold_and_path() {
+        let mut config = make_config("weighted", true);
+        config.probe_bypass_max_input_tokens = Some(100);
+        config.probe_bypass_non_stream = true;
+        // 非流式 + 输入≤阈值 → 豁免
+        assert!(should_bypass_for_probe(
+            &config,
+            ResponsePath::NonStream,
+            100
+        ));
+        assert!(should_bypass_for_probe(
+            &config,
+            ResponsePath::NonStream,
+            50
+        ));
+        // 超过阈值 → 不豁免
+        assert!(!should_bypass_for_probe(
+            &config,
+            ResponsePath::NonStream,
+            101
+        ));
+        // 流式没勾选 → 不豁免（即便输入小）
+        assert!(!should_bypass_for_probe(&config, ResponsePath::Stream, 10));
+    }
+
+    // ===== 输入放大测试 =====
+    fn scale_config() -> CacheOptimizerConfig {
+        let mut c = make_config("weighted", true);
+        c.input_scale_enabled = true;
+        c.input_scale_segments = vec![
+            crate::model::config::InputScaleSegment {
+                min: 0,
+                max: 20_000,
+                read_multiplier: 1.0,
+                write_multiplier: 1.0,
+            },
+            crate::model::config::InputScaleSegment {
+                min: 20_001,
+                max: 120_000,
+                read_multiplier: 2.0,
+                write_multiplier: 3.0,
+            },
+        ];
+        c
+    }
+
+    #[test]
+    fn input_scale_multiplies_by_segment() {
+        let config = scale_config();
+        // 真实输入 60000 落第二档 → read×2, write×3
+        let (r, c, m5, _h1) = apply_input_scale(1000, 500, 500, 0, 60_000, &config);
+        assert_eq!(r, 2000);
+        assert_eq!(c, 1500);
+        assert_eq!(m5, 1500); // 写变了，5m 同步
+    }
+
+    #[test]
+    fn input_scale_only_touches_nonzero() {
+        let config = scale_config();
+        // 只读形态（write=0）→ write 乘后仍 0
+        let (r, c, _m5, _h1) = apply_input_scale(1000, 0, 0, 0, 60_000, &config);
+        assert_eq!(r, 2000);
+        assert_eq!(c, 0);
+    }
+
+    #[test]
+    fn input_scale_supports_decimal_and_cap() {
+        let mut config = scale_config();
+        config.input_scale_segments[1].read_multiplier = 1.5; // 1位小数
+        config.input_scale_max_read = Some(1200); // 放大后封顶
+        // 1000×1.5=1500，但封顶 1200
+        let (r, _c, _m5, _h1) = apply_input_scale(1000, 0, 0, 0, 60_000, &config);
+        assert_eq!(r, 1200);
+    }
+
+    #[test]
+    fn input_scale_disabled_or_no_segment_is_identity() {
+        // 开关关
+        let mut config = scale_config();
+        config.input_scale_enabled = false;
+        assert_eq!(
+            apply_input_scale(1000, 500, 500, 0, 60_000, &config),
+            (1000, 500, 500, 0)
+        );
+        // 无匹配区间（输入超出所有档）
+        let config = scale_config();
+        assert_eq!(
+            apply_input_scale(1000, 500, 500, 0, 999_999, &config),
+            (1000, 500, 500, 0)
+        );
+    }
+}

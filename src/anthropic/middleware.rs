@@ -15,6 +15,7 @@ use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::model::config::CacheOptimizerConfig;
 
 use super::cache_metering::SharedCacheMeter;
 use super::types::ErrorResponse;
@@ -48,6 +49,8 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// 模拟缓存配置：只用于最终返回给下游的 usage 字段。
+    pub cache_optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
 }
 
 impl AppState {
@@ -62,6 +65,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
+            cache_optimizer: Arc::new(parking_lot::RwLock::new(CacheOptimizerConfig::default())),
         }
     }
 
@@ -93,6 +97,14 @@ impl AppState {
     /// 注入链路追踪存储
     pub fn with_trace_store(mut self, store: Option<SharedTraceStore>) -> Self {
         self.trace_store = store;
+        self
+    }
+
+    pub fn with_cache_optimizer(
+        mut self,
+        optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
+    ) -> Self {
+        self.cache_optimizer = optimizer;
         self
     }
 }

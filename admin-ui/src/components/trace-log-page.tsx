@@ -181,8 +181,20 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   const cacheCreation = rec.cacheCreationTokens ?? 0
   const cacheRead = rec.cacheReadTokens ?? 0
   const total = rec.totalTokens ?? input + output + cacheCreation + cacheRead
-  // 全 0（早期失败、未走到上游）时不显示明细，仅占位
-  if (total === 0) {
+  const simulatedRows: Array<[string, number]> = []
+  if (
+    rec.simulatedInputTokens != null ||
+    rec.simulatedOutputTokens != null ||
+    rec.simulatedCacheCreationTokens != null ||
+    rec.simulatedCacheReadTokens != null
+  ) {
+    simulatedRows.push(['模拟输入 Token', rec.simulatedInputTokens ?? 0])
+    simulatedRows.push(['模拟输出 Token', rec.simulatedOutputTokens ?? output])
+    simulatedRows.push(['模拟缓存创建 Token', rec.simulatedCacheCreationTokens ?? 0])
+    simulatedRows.push(['模拟缓存读取 Token', rec.simulatedCacheReadTokens ?? 0])
+  }
+  // 全 0（早期失败、未走到上游）且没有模拟返回值时不显示明细，仅占位
+  if (total === 0 && simulatedRows.length === 0) {
     return <span className="text-muted-foreground">—</span>
   }
   const rows: Array<[string, number]> = [
@@ -220,6 +232,19 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
                   {formatTokenFull(total)}
                 </span>
               </div>
+              {simulatedRows.length > 0 && (
+                <div className="mt-2 border-t border-border/50 pt-1.5">
+                  <div className="mb-1 text-[12px] font-medium">模拟返回 Token</div>
+                  <div className="space-y-1">
+                    {simulatedRows.map(([label, val]) => (
+                      <div key={label} className="flex items-center justify-between gap-6">
+                        <span className="text-muted-foreground">{label}</span>
+                        <span className="font-mono tabular-nums">{formatTokenFull(val)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </TooltipContent>

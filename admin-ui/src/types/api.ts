@@ -1,4 +1,49 @@
 // 凭据状态响应
+export interface CacheSegment {
+  min: number
+  max: number
+  weight: number
+}
+
+export interface InputScaleSegment {
+  min: number
+  max: number
+  readMultiplier: number
+  writeMultiplier: number
+}
+
+export interface CacheOptimizerConfig {
+  enabled: boolean
+  enabledStream: boolean
+  enabledNonStream: boolean
+  enabledBuffered: boolean
+  mode: 'passthrough' | 'zero' | 'cap' | 'random' | 'weighted'
+  readMin: number
+  readMax: number
+  writeMin: number
+  writeMax: number
+  weightReadOnly: number
+  weightWriteOnly: number
+  weightReadWrite: number
+  weightNone: number
+  useSegmentWeights: boolean
+  readSegments: CacheSegment[]
+  writeSegments: CacheSegment[]
+  rewriteOnlyWhenPresent: boolean
+  keepRawBreakdown: boolean
+  inputRandomMax: number
+  inputOnlyRandomEnabled: boolean
+  inputOnlyRandomMax: number
+  probeBypassMaxInputTokens: number | null
+  probeBypassStream: boolean
+  probeBypassNonStream: boolean
+  probeBypassBuffered: boolean
+  inputScaleEnabled: boolean
+  inputScaleMaxRead: number | null
+  inputScaleMaxWrite: number | null
+  inputScaleSegments: InputScaleSegment[]
+}
+
 export interface CredentialsStatusResponse {
   total: number
   available: number
@@ -506,6 +551,10 @@ export interface TraceRecord {
   credits?: number
   /** 首 Token 延迟（毫秒，仅流式有值） */
   firstTokenMs?: number | null
+  simulatedInputTokens?: number | null
+  simulatedOutputTokens?: number | null
+  simulatedCacheCreationTokens?: number | null
+  simulatedCacheReadTokens?: number | null
   attempts: TraceAttempt[]
 }
 

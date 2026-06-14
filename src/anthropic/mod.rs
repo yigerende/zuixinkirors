@@ -23,6 +23,7 @@
 //! ```
 
 mod converter;
+mod cache_rewriter;
 mod handlers;
 mod middleware;
 pub mod cache_metering;

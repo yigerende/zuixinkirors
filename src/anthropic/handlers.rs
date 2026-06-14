@@ -1,6 +1,7 @@
 //! Anthropic API Handler 函数
 
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
@@ -11,6 +12,7 @@ use crate::admin::trace_db::{
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::model::config::CacheOptimizerConfig;
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -54,6 +56,14 @@ pub(crate) struct UsageRecordHook {
     pub started_at: Instant,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SimulatedTokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+}
+
 impl UsageRecordHook {
     pub fn from_state(state: &AppState, key_id: u64, model: String) -> Self {
         Self {
@@ -76,6 +86,30 @@ impl UsageRecordHook {
         credits: f64,
         status: &str,
     ) {
+        self.record_with_simulated(
+            credential_id,
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+            credits,
+            status,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_with_simulated(
+        &self,
+        credential_id: u64,
+        input_tokens: i32,
+        output_tokens: i32,
+        cache_creation_tokens: i32,
+        cache_read_tokens: i32,
+        credits: f64,
+        status: &str,
+        simulated: Option<SimulatedTokenUsage>,
+    ) {
         let rec = UsageRecord {
             ts: Utc::now().to_rfc3339(),
             key_id: self.key_id,
@@ -92,6 +126,10 @@ impl UsageRecordHook {
             },
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             status: status.to_string(),
+            simulated_input_tokens: simulated.map(|s| s.input_tokens),
+            simulated_output_tokens: simulated.map(|s| s.output_tokens),
+            simulated_cache_creation_tokens: simulated.map(|s| s.cache_creation_tokens),
+            simulated_cache_read_tokens: simulated.map(|s| s.cache_read_tokens),
         };
         if let Some(r) = &self.recorder {
             r.record(&rec);
@@ -143,6 +181,7 @@ pub(crate) struct TraceUsage {
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
     pub credits: f64,
+    pub simulated: Option<SimulatedTokenUsage>,
 }
 
 impl TraceUsage {
@@ -219,6 +258,10 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
+            simulated_input_tokens: usage.simulated.map(|s| s.input_tokens),
+            simulated_output_tokens: usage.simulated.map(|s| s.output_tokens),
+            simulated_cache_creation_tokens: usage.simulated.map(|s| s.cache_creation_tokens),
+            simulated_cache_read_tokens: usage.simulated.map(|s| s.cache_read_tokens),
             attempts,
         };
         store.insert(&rec);
@@ -696,6 +739,7 @@ pub async fn post_messages(
             known_tool_names,
             hook,
             cache_usage,
+            state.cache_optimizer.clone(),
             tracer,
             key_ctx.group.clone(),
         )
@@ -721,6 +765,7 @@ pub async fn post_messages(
             known_tool_names,
             hook,
             cache_usage,
+            state.cache_optimizer.clone(),
             tracer,
             key_ctx.group.clone(),
         )
@@ -739,6 +784,7 @@ async fn handle_stream_request(
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
+    cache_optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -758,6 +804,7 @@ async fn handle_stream_request(
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
     ctx.cache_usage = cache_usage;
+    ctx.cache_optimizer = Some(cache_optimizer);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -900,7 +947,11 @@ fn record_stream_usage(
 ) {
     // 互斥分摊后的 (input, cache_creation, cache_read)，与 trace 上报口径一致。
     let (input, cache_creation, cache_read) = ctx.resolved_usage();
-    hook.record(
+    let simulated = simulated_usage_from_tuple(
+        ctx.simulated_usage(super::cache_rewriter::ResponsePath::Stream),
+        ctx.output_tokens,
+    );
+    hook.record_with_simulated(
         credential_id,
         input,
         ctx.output_tokens,
@@ -908,6 +959,7 @@ fn record_stream_usage(
         cache_read,
         ctx.credits,
         status,
+        Some(simulated),
     );
 }
 
@@ -920,6 +972,22 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
         credits: if ctx.credits.is_finite() && ctx.credits > 0.0 { ctx.credits } else { 0.0 },
+        simulated: Some(simulated_usage_from_tuple(
+            ctx.simulated_usage(super::cache_rewriter::ResponsePath::Stream),
+            ctx.output_tokens,
+        )),
+    }
+}
+
+fn simulated_usage_from_tuple(
+    usage: (i32, i32, i32),
+    output_tokens: i32,
+) -> SimulatedTokenUsage {
+    SimulatedTokenUsage {
+        input_tokens: usage.0.max(0) as u64,
+        output_tokens: output_tokens.max(0) as u64,
+        cache_creation_tokens: usage.1.max(0) as u64,
+        cache_read_tokens: usage.2.max(0) as u64,
     }
 }
 
@@ -938,6 +1006,7 @@ async fn handle_non_stream_request(
     _known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
+    cache_optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -1122,6 +1191,14 @@ async fn handle_non_stream_request(
     // 互斥分摊：input + cache_creation + cache_read == total
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
         cache_usage.split_against_total(total_input_tokens);
+    let simulated_usage = super::cache_rewriter::rewrite_usage_for_response(
+        final_input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        &cache_optimizer.read(),
+        super::cache_rewriter::ResponsePath::NonStream,
+    );
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1133,14 +1210,14 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens,
-            "cache_creation_input_tokens": cache_creation_tokens,
-            "cache_read_input_tokens": cache_read_tokens
+            "input_tokens": simulated_usage.input_tokens,
+            "output_tokens": simulated_usage.output_tokens,
+            "cache_creation_input_tokens": simulated_usage.cache_creation_tokens,
+            "cache_read_input_tokens": simulated_usage.cache_read_tokens
         }
     });
 
-    hook.record(
+    hook.record_with_simulated(
         credential_id,
         final_input_tokens,
         output_tokens,
@@ -1148,6 +1225,12 @@ async fn handle_non_stream_request(
         cache_read_tokens,
         credits,
         "success",
+        Some(SimulatedTokenUsage {
+            input_tokens: simulated_usage.input_tokens.max(0) as u64,
+            output_tokens: simulated_usage.output_tokens.max(0) as u64,
+            cache_creation_tokens: simulated_usage.cache_creation_tokens.max(0) as u64,
+            cache_read_tokens: simulated_usage.cache_read_tokens.max(0) as u64,
+        }),
     );
     tracer.finalize(
         "success",
@@ -1160,6 +1243,12 @@ async fn handle_non_stream_request(
             cache_creation_tokens: cache_creation_tokens.max(0) as u64,
             cache_read_tokens: cache_read_tokens.max(0) as u64,
             credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+            simulated: Some(SimulatedTokenUsage {
+                input_tokens: simulated_usage.input_tokens.max(0) as u64,
+                output_tokens: simulated_usage.output_tokens.max(0) as u64,
+                cache_creation_tokens: simulated_usage.cache_creation_tokens.max(0) as u64,
+                cache_read_tokens: simulated_usage.cache_read_tokens.max(0) as u64,
+            }),
         },
     );
     (StatusCode::OK, Json(response_body)).into_response()
@@ -1449,6 +1538,7 @@ pub async fn post_messages_cc(
             hook,
             total_input_tokens,
             cache_usage,
+            state.cache_optimizer.clone(),
             tracer,
             key_ctx.group.clone(),
         )
@@ -1474,6 +1564,7 @@ pub async fn post_messages_cc(
             known_tool_names,
             hook,
             cache_usage,
+            state.cache_optimizer.clone(),
             tracer,
             key_ctx.group.clone(),
         )
@@ -1495,6 +1586,7 @@ async fn handle_stream_request_buffered(
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
+    cache_optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -1519,6 +1611,7 @@ async fn handle_stream_request_buffered(
         known_tool_names,
     );
     ctx.set_cache_usage(cache_usage);
+    ctx.set_cache_optimizer(cache_optimizer);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
@@ -1610,7 +1703,14 @@ fn create_buffered_sse_stream(
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
-                                hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                let (si, so, scc, scr) = ctx.simulated_final_usage();
+                                let simulated = SimulatedTokenUsage {
+                                    input_tokens: si.max(0) as u64,
+                                    output_tokens: so.max(0) as u64,
+                                    cache_creation_tokens: scc.max(0) as u64,
+                                    cache_read_tokens: scr.max(0) as u64,
+                                };
+                                hook.record_with_simulated(credential_id, i, o, cc, cr, credits, "error", Some(simulated));
                                 // 缓冲模式 chunk 读取失败：上游中途断流
                                 tracer.finalize(
                                     "interrupted",
@@ -1623,6 +1723,7 @@ fn create_buffered_sse_stream(
                                         cache_creation_tokens: cc.max(0) as u64,
                                         cache_read_tokens: cr.max(0) as u64,
                                         credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                        simulated: Some(simulated),
                                     },
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
@@ -1635,7 +1736,14 @@ fn create_buffered_sse_stream(
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
-                                hook.record(credential_id, i, o, cc, cr, credits, "success");
+                                let (si, so, scc, scr) = ctx.simulated_final_usage();
+                                let simulated = SimulatedTokenUsage {
+                                    input_tokens: si.max(0) as u64,
+                                    output_tokens: so.max(0) as u64,
+                                    cache_creation_tokens: scc.max(0) as u64,
+                                    cache_read_tokens: scr.max(0) as u64,
+                                };
+                                hook.record_with_simulated(credential_id, i, o, cc, cr, credits, "success", Some(simulated));
                                 tracer.finalize(
                                     "success",
                                     None,
@@ -1647,6 +1755,7 @@ fn create_buffered_sse_stream(
                                         cache_creation_tokens: cc.max(0) as u64,
                                         cache_read_tokens: cr.max(0) as u64,
                                         credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                        simulated: Some(simulated),
                                     },
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events

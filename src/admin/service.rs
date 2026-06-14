@@ -14,7 +14,7 @@ use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
-use crate::model::config::Config;
+use crate::model::config::{CacheOptimizerConfig, Config};
 
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
@@ -118,6 +118,8 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// 模拟缓存配置热更新句柄。
+    cache_optimizer_live: Option<Arc<parking_lot::RwLock<CacheOptimizerConfig>>>,
 }
 
 /// Social 登录会话状态
@@ -424,6 +426,7 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            cache_optimizer_live: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -458,6 +461,54 @@ impl AdminService {
         self.trace_store = trace_store;
         self.usage_recorder = usage_recorder;
         self
+    }
+
+    pub fn with_cache_optimizer(
+        mut self,
+        optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
+    ) -> Self {
+        self.cache_optimizer_live = Some(optimizer);
+        self
+    }
+
+    pub fn get_cache_optimizer(&self) -> CacheOptimizerConfig {
+        if let Some(live) = &self.cache_optimizer_live {
+            live.read().clone()
+        } else {
+            self.token_manager.config().cache_optimizer.clone()
+        }
+    }
+
+    pub fn set_cache_optimizer(
+        &self,
+        new_config: CacheOptimizerConfig,
+    ) -> Result<CacheOptimizerConfig, AdminServiceError> {
+        let valid_modes = ["passthrough", "zero", "cap", "random", "weighted"];
+        if !valid_modes.contains(&new_config.mode.as_str()) {
+            return Err(AdminServiceError::InvalidCredential(
+                "mode 必须是 passthrough / zero / cap / random / weighted 之一".to_string(),
+            ));
+        }
+
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| AdminServiceError::InternalError("配置文件路径未知".to_string()))?;
+
+        let mut config = Config::load(&config_path)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        config.cache_optimizer = new_config.clone();
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        if let Some(live) = &self.cache_optimizer_live {
+            *live.write() = new_config.clone();
+        }
+
+        Ok(new_config)
     }
 
     /// 获取所有凭据状态

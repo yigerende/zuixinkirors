@@ -11,6 +11,7 @@ use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::admin::trace_db::SharedTraceStore;
 use crate::kiro::provider::KiroProvider;
+use crate::model::config::CacheOptimizerConfig;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
@@ -37,6 +38,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        std::sync::Arc::new(parking_lot::RwLock::new(CacheOptimizerConfig::default())),
     )
 }
 
@@ -50,6 +52,7 @@ pub fn create_router(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    cache_optimizer: std::sync::Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking);
     if let Some(provider) = kiro_provider {
@@ -58,6 +61,7 @@ pub fn create_router(
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
+    state = state.with_cache_optimizer(cache_optimizer);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

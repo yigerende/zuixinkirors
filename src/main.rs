@@ -259,6 +259,10 @@ async fn main() {
     )));
     cache_meter.clone().spawn_background();
 
+    // 模拟缓存配置仅用于最终下游响应字段改写；内部上游调用与真实统计逻辑不读取它。
+    let cache_optimizer =
+        std::sync::Arc::new(parking_lot::RwLock::new(config.cache_optimizer.clone()));
+
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider),
         config.extract_thinking,
@@ -267,6 +271,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
+        cache_optimizer.clone(),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
@@ -288,7 +293,8 @@ async fn main() {
                     .with_log_governance(
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),
-                    );
+                    )
+                    .with_cache_optimizer(cache_optimizer.clone());
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,

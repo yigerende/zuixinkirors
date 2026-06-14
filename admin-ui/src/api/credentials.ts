@@ -35,6 +35,7 @@ import type {
   UpdateCheckInfo,
   GitHubRateLimitInfo,
   UpdateAdminKeyRequest,
+  CacheOptimizerConfig,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -59,6 +60,16 @@ api.interceptors.request.use((config) => {
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
   const { data } = await api.get<CredentialsStatusResponse>('/credentials')
   return data
+}
+
+export async function getCacheOptimizer(): Promise<CacheOptimizerConfig> {
+  const { data } = await api.get<{ config: CacheOptimizerConfig }>('/cache-optimizer')
+  return data.config
+}
+
+export async function setCacheOptimizer(config: CacheOptimizerConfig): Promise<CacheOptimizerConfig> {
+  const { data } = await api.put<{ config: CacheOptimizerConfig }>('/cache-optimizer', config)
+  return data.config
 }
 
 // ============ KAM 导出 ============

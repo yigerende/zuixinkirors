@@ -49,6 +49,15 @@ pub struct UsageRecord {
     pub duration_ms: u64,
     /// "success" 或 "error"
     pub status: String,
+    /// 模拟缓存开启时最终返回给下游的 input_tokens；None 表示未改写或旧记录。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulated_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulated_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulated_cache_creation_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulated_cache_read_tokens: Option<u64>,
 }
 
 /// 按天 rotate 的 JSONL writer
@@ -733,6 +742,10 @@ mod tests {
             credits: 0.05,
             duration_ms: 1500,
             status: "success".to_string(),
+            simulated_input_tokens: None,
+            simulated_output_tokens: None,
+            simulated_cache_creation_tokens: None,
+            simulated_cache_read_tokens: None,
         };
         agg.ingest(&rec);
         agg.ingest(&rec);
@@ -771,6 +784,10 @@ mod tests {
             credits: 0.01,
             duration_ms: 100,
             status: "success".to_string(),
+            simulated_input_tokens: None,
+            simulated_output_tokens: None,
+            simulated_cache_creation_tokens: None,
+            simulated_cache_read_tokens: None,
         };
         let rec_b = UsageRecord {
             ts: now,
@@ -784,6 +801,10 @@ mod tests {
             credits: 0.02,
             duration_ms: 200,
             status: "error".to_string(),
+            simulated_input_tokens: None,
+            simulated_output_tokens: None,
+            simulated_cache_creation_tokens: None,
+            simulated_cache_read_tokens: None,
         };
         agg.ingest(&rec_a);
         agg.ingest(&rec_b);
@@ -838,6 +859,10 @@ mod tests {
             credits: 0.01,
             duration_ms: 100,
             status: "success".to_string(),
+            simulated_input_tokens: None,
+            simulated_output_tokens: None,
+            simulated_cache_creation_tokens: None,
+            simulated_cache_read_tokens: None,
         };
         let rec_today = UsageRecord {
             ts: today_noon,
@@ -851,6 +876,10 @@ mod tests {
             credits: 0.02,
             duration_ms: 100,
             status: "success".to_string(),
+            simulated_input_tokens: None,
+            simulated_output_tokens: None,
+            simulated_cache_creation_tokens: None,
+            simulated_cache_read_tokens: None,
         };
         agg.ingest(&rec_yesterday);
         agg.ingest(&rec_today);
@@ -900,6 +929,10 @@ mod tests {
             credits: 0.0,
             duration_ms: 100,
             status: "error".to_string(),
+            simulated_input_tokens: None,
+            simulated_output_tokens: None,
+            simulated_cache_creation_tokens: None,
+            simulated_cache_read_tokens: None,
         };
         agg.ingest(&rec);
         let ov = agg.overview();

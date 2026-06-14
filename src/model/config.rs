@@ -17,6 +17,162 @@ impl Default for TlsBackend {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheSegment {
+    pub min: u64,
+    pub max: u64,
+    pub weight: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputScaleSegment {
+    pub min: u64,
+    pub max: u64,
+    pub read_multiplier: f64,
+    pub write_multiplier: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheOptimizerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub enabled_stream: bool,
+    #[serde(default = "default_true")]
+    pub enabled_non_stream: bool,
+    #[serde(default = "default_true")]
+    pub enabled_buffered: bool,
+    #[serde(default = "default_cache_optimizer_mode")]
+    pub mode: String,
+    #[serde(default = "default_read_min")]
+    pub read_min: u64,
+    #[serde(default = "default_read_max")]
+    pub read_max: u64,
+    #[serde(default)]
+    pub write_min: u64,
+    #[serde(default = "default_write_max")]
+    pub write_max: u64,
+    #[serde(default = "default_weight_read_only")]
+    pub weight_read_only: u32,
+    #[serde(default = "default_weight_write_only")]
+    pub weight_write_only: u32,
+    #[serde(default = "default_weight_read_write")]
+    pub weight_read_write: u32,
+    #[serde(default)]
+    pub weight_none: u32,
+    #[serde(default)]
+    pub use_segment_weights: bool,
+    #[serde(default = "default_read_segments")]
+    pub read_segments: Vec<CacheSegment>,
+    #[serde(default = "default_write_segments")]
+    pub write_segments: Vec<CacheSegment>,
+    #[serde(default = "default_true")]
+    pub rewrite_only_when_present: bool,
+    #[serde(default = "default_true")]
+    pub keep_raw_breakdown: bool,
+    #[serde(default)]
+    pub input_random_max: u32,
+    #[serde(default)]
+    pub input_only_random_enabled: bool,
+    #[serde(default)]
+    pub input_only_random_max: u32,
+    #[serde(default)]
+    pub probe_bypass_max_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub probe_bypass_stream: bool,
+    #[serde(default)]
+    pub probe_bypass_non_stream: bool,
+    #[serde(default)]
+    pub probe_bypass_buffered: bool,
+    #[serde(default)]
+    pub input_scale_enabled: bool,
+    #[serde(default)]
+    pub input_scale_max_read: Option<u64>,
+    #[serde(default)]
+    pub input_scale_max_write: Option<u64>,
+    #[serde(default)]
+    pub input_scale_segments: Vec<InputScaleSegment>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_cache_optimizer_mode() -> String {
+    "weighted".to_string()
+}
+fn default_read_min() -> u64 {
+    300
+}
+fn default_read_max() -> u64 {
+    1200
+}
+fn default_write_max() -> u64 {
+    500
+}
+fn default_weight_read_only() -> u32 {
+    55
+}
+fn default_weight_write_only() -> u32 {
+    15
+}
+fn default_weight_read_write() -> u32 {
+    30
+}
+fn default_read_segments() -> Vec<CacheSegment> {
+    vec![
+        CacheSegment { min: 90000, max: 110000, weight: 35 },
+        CacheSegment { min: 110001, max: 130000, weight: 45 },
+        CacheSegment { min: 130001, max: 145000, weight: 20 },
+    ]
+}
+fn default_write_segments() -> Vec<CacheSegment> {
+    vec![
+        CacheSegment { min: 20, max: 200, weight: 55 },
+        CacheSegment { min: 201, max: 800, weight: 35 },
+        CacheSegment { min: 801, max: 3000, weight: 10 },
+    ]
+}
+
+impl Default for CacheOptimizerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            enabled_stream: true,
+            enabled_non_stream: true,
+            enabled_buffered: true,
+            mode: default_cache_optimizer_mode(),
+            read_min: default_read_min(),
+            read_max: default_read_max(),
+            write_min: 0,
+            write_max: default_write_max(),
+            weight_read_only: default_weight_read_only(),
+            weight_write_only: default_weight_write_only(),
+            weight_read_write: default_weight_read_write(),
+            weight_none: 0,
+            use_segment_weights: false,
+            read_segments: default_read_segments(),
+            write_segments: default_write_segments(),
+            rewrite_only_when_present: true,
+            keep_raw_breakdown: true,
+            input_random_max: 0,
+            input_only_random_enabled: false,
+            input_only_random_max: 0,
+            probe_bypass_max_input_tokens: None,
+            probe_bypass_stream: false,
+            probe_bypass_non_stream: false,
+            probe_bypass_buffered: false,
+            input_scale_enabled: false,
+            input_scale_max_read: None,
+            input_scale_max_write: None,
+            input_scale_segments: Vec::new(),
+        }
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -154,6 +310,10 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
+    /// 仅改写返回给下游的 usage 字段；不参与内部上游调用、调度、真实统计。
+    #[serde(default)]
+    pub cache_optimizer: CacheOptimizerConfig,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -268,6 +428,7 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
+            cache_optimizer: CacheOptimizerConfig::default(),
             endpoints: HashMap::new(),
             config_path: None,
         }

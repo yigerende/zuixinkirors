@@ -3,11 +3,13 @@
 //! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
+use crate::model::config::CacheOptimizerConfig;
 
 /// thinking 块的 signature 占位字符串
 ///
@@ -1086,6 +1088,8 @@ pub struct StreamContext {
     /// 做互斥分摊：`input + cache_creation + cache_read == total`，避免把被缓存
     /// 覆盖的前缀重复计进 input_tokens。
     pub cache_usage: super::cache_metering::CacheUsage,
+    /// 模拟缓存配置：只用于最终返回给下游的 usage 字段。
+    pub cache_optimizer: Option<Arc<parking_lot::RwLock<CacheOptimizerConfig>>>,
     /// meteringEvent 上报的 credit 计费量（上游真实下发）
     pub credits: f64,
     /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
@@ -1106,6 +1110,26 @@ impl StreamContext {
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
         let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
         self.cache_usage.split_against_total(total_real)
+    }
+
+    /// 仅用于写给下游 response 的模拟 usage；内部记录继续使用 resolved_usage。
+    pub fn simulated_usage(
+        &self,
+        path: super::cache_rewriter::ResponsePath,
+    ) -> (i32, i32, i32) {
+        let (input, creation, read) = self.resolved_usage();
+        let Some(optimizer) = &self.cache_optimizer else {
+            return (input, creation, read);
+        };
+        let simulated = super::cache_rewriter::rewrite_usage_for_response(
+            input,
+            self.output_tokens,
+            creation,
+            read,
+            &optimizer.read(),
+            path,
+        );
+        (simulated.input_tokens, simulated.cache_creation_tokens, simulated.cache_read_tokens)
     }
     /// 创建 StreamContext
     pub fn new_with_thinking(
@@ -1137,6 +1161,7 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
+            cache_optimizer: None,
             credits: 0.0,
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
@@ -2141,7 +2166,8 @@ impl StreamContext {
         }
 
         // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
-        let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
+        let (final_input_tokens, cache_creation, cache_read) =
+            self.simulated_usage(super::cache_rewriter::ResponsePath::Stream);
 
         // 生成最终事件
         events.extend(self.state_manager.generate_final_events(
@@ -2201,6 +2227,13 @@ impl BufferedStreamContext {
         self.inner.cache_usage = cache_usage;
     }
 
+    pub fn set_cache_optimizer(
+        &mut self,
+        optimizer: Arc<parking_lot::RwLock<CacheOptimizerConfig>>,
+    ) {
+        self.inner.cache_optimizer = Some(optimizer);
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -2232,7 +2265,9 @@ impl BufferedStreamContext {
         }
 
         // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
-        let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
+        let (final_input_tokens, cache_creation, cache_read) =
+            self.inner
+                .simulated_usage(super::cache_rewriter::ResponsePath::Buffered);
 
         // 生成最终事件（StreamContext 内部会用同样的优先级与分摊）
         let final_events = self.inner.generate_final_events();
@@ -2266,6 +2301,13 @@ impl BufferedStreamContext {
             read,
             self.inner.credits,
         )
+    }
+
+    pub fn simulated_final_usage(&self) -> (i32, i32, i32, i32) {
+        let (input, creation, read) =
+            self.inner
+                .simulated_usage(super::cache_rewriter::ResponsePath::Buffered);
+        (input, self.inner.output_tokens, creation, read)
     }
 }
 
