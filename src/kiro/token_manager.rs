@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -753,6 +754,15 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
+    /// 当前在途请求数（选中即 +1，ConcurrencyGuard drop 时 -1）
+    ///
+    /// 运行时态，不持久化。least-active 选号的主键（balanced）/同档内次键（priority）。
+    /// 与 success_count（长期均衡裁决）完全独立。
+    active: u32,
+    /// 当前等待该凭据释放槽位的请求数（仅前端显示 + 粘性过载判断）
+    ///
+    /// 运行时态，不持久化。仅在第二层硬上限触发等待时变化。
+    waiting: u32,
 }
 
 /// 禁用原因
@@ -841,6 +851,12 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 并发硬上限（0 = 不限制）
+    pub max_concurrency: u32,
+    /// 当前在途请求数
+    pub active_concurrency: u32,
+    /// 当前等待该凭据释放槽位的请求数
+    pub waiting_concurrency: u32,
 }
 
 /// 凭据管理器状态快照
@@ -885,12 +901,34 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// balanced 模式下的会话到凭据绑定，避免同一对话在账号之间来回漂移
+    session_affinity: Mutex<HashMap<String, SessionAffinityEntry>>,
+    /// 指向自身的 Weak 引用，用于 ConcurrencyGuard 在 Drop 时回到管理器释放槽位。
+    /// 在 `Arc::new(manager)` 之后通过 `init_weak_self` 填充。
+    self_weak: Mutex<Weak<MultiTokenManager>>,
+}
+
+#[derive(Clone)]
+struct SessionAffinityEntry {
+    credential_id: u64,
+    last_used_at: Instant,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+
+/// 会话亲和有效期，避免长期运行进程积累无限会话 key
+const SESSION_AFFINITY_TTL: StdDuration = StdDuration::from_secs(2 * 60 * 60);
+/// 第二层兜底：满载等待的单次轮询间隔
+const CONCURRENCY_WAIT_POLL: StdDuration = StdDuration::from_millis(80);
+/// 第二层兜底：满载等待的总时长上限（超时返回繁忙 429）
+const CONCURRENCY_WAIT_BUDGET: StdDuration = StdDuration::from_secs(2);
+/// 粘性会话原号等待数阈值，超过即放弃亲和换号
+const STICKY_MAX_WAITING: u32 = 2;
+/// 并发繁忙错误标记串（bail 与 map_provider_error 共用，避免改文案导致映射失效）
+pub const CONCURRENCY_BUSY_TAG: &str = "CONCURRENCY_BUSY";
 
 /// API 调用上下文
 ///
@@ -904,7 +942,83 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 本次是否命中会话亲和（balanced 模式复用了已绑定凭据）。仅用于日志展示。
+    pub session_affinity_hit: bool,
 }
+
+/// 并发槽位 RAII 守卫
+///
+/// 在选号、`active += 1` 的同一处生成，一路透传到请求生命周期结束（非流式读完
+/// body / 流式读到 stream_end / 客户端断开 / 出错 / panic）。Drop 时持 entries 锁把
+/// 对应凭据的 `active` 做一次 `saturating_sub(1)`，覆盖全部分支。
+///
+/// 严禁手动 `active -= 1`，释放只能走 Drop。
+pub struct ConcurrencyGuard {
+    manager: Weak<MultiTokenManager>,
+    credential_id: u64,
+    released: bool,
+}
+
+impl ConcurrencyGuard {
+    fn new(manager: Weak<MultiTokenManager>, credential_id: u64) -> Self {
+        Self {
+            manager,
+            credential_id,
+            released: false,
+        }
+    }
+
+    /// 占位守卫：不绑定任何凭据，Drop 时不做任何事。
+    /// 仅用于无法获得管理器 Weak 引用的边界场景（self_weak 未初始化）。
+    fn noop() -> Self {
+        Self {
+            manager: Weak::new(),
+            credential_id: 0,
+            released: true,
+        }
+    }
+}
+
+impl Drop for ConcurrencyGuard {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        if let Some(manager) = self.manager.upgrade() {
+            manager.release_active_slot(self.credential_id);
+        }
+    }
+}
+
+/// 选号并占用槽位的内部结果
+#[allow(clippy::large_enum_variant)]
+enum ReserveOutcome {
+    /// 已选中并占用：凭据 id、凭据信息、是否命中会话亲和、槽位守卫
+    Reserved(u64, KiroCredentials, bool, ConcurrencyGuard),
+    /// 有可用凭据但全部满载（仅在配置了 max_concurrency 时可能）
+    /// 附带"打算等待的那个凭据 id"，用于前端 waiting 显示
+    AllFull(u64),
+    /// 无任何可用（未禁用 / 未冷却 / 模型与分组匹配）的凭据
+    Empty,
+}
+
+/// 占用指定凭据槽位的结果
+#[allow(clippy::large_enum_variant)]
+enum ReserveOne {
+    /// 已占用，返回凭据信息与守卫
+    Ok(KiroCredentials, ConcurrencyGuard),
+    /// 该凭据满载（max_concurrency>0 且 active>=max_concurrency）
+    Full,
+    /// 该凭据不可用（禁用 / 冷却 / 不存在 / 不支持该模型 / 分组不匹配）
+    Unavailable,
+}
+
+/// 编译期断言：ConcurrencyGuard 必须 Send + Sync（要跨 async 边界放进 stream 状态）
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ConcurrencyGuard>();
+};
 
 /// 判断某账号的分组集合是否匹配请求所属分组（严格隔离）
 ///
@@ -974,6 +1088,8 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
+                    active: 0,
+                    waiting: 0,
                 }
             })
             .collect();
@@ -1034,6 +1150,8 @@ impl MultiTokenManager {
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            session_affinity: Mutex::new(HashMap::new()),
+            self_weak: Mutex::new(Weak::new()),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1108,89 +1226,327 @@ impl MultiTokenManager {
             .count()
     }
 
-    /// 根据负载均衡模式选择下一个凭据
+    /// 构建一个绑定到指定凭据的并发守卫。
+    /// 若 self_weak 尚未初始化（如单测未走 Arc 流程），返回 no-op 守卫并告警。
+    fn make_guard(&self, credential_id: u64) -> ConcurrencyGuard {
+        let weak = self.self_weak.lock().clone();
+        if weak.strong_count() == 0 {
+            tracing::warn!(
+                "ConcurrencyGuard 退化为 no-op（self_weak 未初始化，凭据 #{}）：\
+                 active 不会被释放。请确认 main.rs 在 Arc::new 后调用了 init_weak_self()",
+                credential_id
+            );
+            ConcurrencyGuard::noop()
+        } else {
+            ConcurrencyGuard::new(weak, credential_id)
+        }
+    }
+
+    /// 在 `Arc::new(manager)` 之后、对外服务之前调用一次，填充 self_weak。
+    /// 否则 ConcurrencyGuard 在 Drop 时无法回到管理器释放槽位（退化为 no-op）。
+    pub fn init_weak_self(self: &Arc<Self>) {
+        *self.self_weak.lock() = Arc::downgrade(self);
+    }
+
+    /// 释放指定凭据的一个在途槽位（仅供 ConcurrencyGuard::drop 调用）。
+    /// 持 entries 锁，`saturating_sub` 防下溢；凭据已删除则忽略。
+    fn release_active_slot(&self, credential_id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == credential_id) {
+            entry.active = entry.active.saturating_sub(1);
+        }
+    }
+
+    /// 候选过滤：未禁用 + 未冷却 + 支持该模型（opus 订阅）+ 分组匹配。
+    /// 这是 kiro.rs 版相对 junnl 的关键差异——叠加了 throttled 与 group 两道闸。
+    fn entry_is_available(entry: &CredentialEntry, is_opus: bool, group: Option<&str>, now: Instant) -> bool {
+        if entry.disabled {
+            return false;
+        }
+        if entry.throttled_until.map(|t| t > now).unwrap_or(false) {
+            return false;
+        }
+        if is_opus && !entry.credentials.supports_opus() {
+            return false;
+        }
+        group_matches(&entry.credentials.groups, group)
+    }
+
+    fn model_is_opus(model: Option<&str>) -> bool {
+        model.map(|m| m.to_lowercase().contains("opus")).unwrap_or(false)
+    }
+
+    fn is_full(entry: &CredentialEntry) -> bool {
+        let max = entry.credentials.max_concurrency;
+        max > 0 && entry.active >= max
+    }
+
+    /// 测试辅助：执行一次 least-active 选号并返回被选中的凭据 id（会占用一个槽位）。
+    /// 仅供单测使用，等价于旧 `select_next_credential` 的「选哪个」语义。
+    #[cfg(test)]
+    fn pick_credential_id(&self, model: Option<&str>, group: Option<&str>) -> Option<u64> {
+        match self.reserve_best(model, group) {
+            ReserveOutcome::Reserved(id, _, _, _guard) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// 测试辅助：读取指定凭据当前在途数。
+    #[cfg(test)]
+    fn active_count(&self, id: u64) -> u32 {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.active)
+            .unwrap_or(0)
+    }
+
+    /// least-active 选号并在同一把锁内 `active += 1`（原子抢槽，消除 TOCTOU）。
     ///
-    /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
+    /// - balanced：主键 `active` 最小 → 平手 `success_count` 最小 → 再平手随机。
+    /// - priority：先锁定最高优先级（priority 最小）**可用未满载**档 → 档内 `active`
+    ///   最小 → 平手随机。落档只在高档全满时发生。
     ///
-    /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(
-        &self,
-        model: Option<&str>,
-        group: Option<&str>,
-    ) -> Option<(u64, KiroCredentials)> {
-        let entries = self.entries.lock();
+    /// 满载（max_concurrency>0 且 active>=max）的凭据被跳过；全满返回 AllFull。
+    fn reserve_best(&self, model: Option<&str>, group: Option<&str>) -> ReserveOutcome {
+        let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+        let is_opus = Self::model_is_opus(model);
         let now = Instant::now();
 
-        // 检查是否是 opus 模型
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
+        let mut entries = self.entries.lock();
 
-        // 过滤可用凭据
-        let available: Vec<_> = entries
+        // 第一步：可用（未禁用 / 未冷却 / 模型 / 分组）凭据
+        let available_ids: Vec<u64> = entries
             .iter()
-            .filter(|e| {
-                if e.disabled {
-                    return false;
-                }
-                // 临时冷却中（账号级 429 风控）：跳过
-                if e.throttled_until.map(|t| t > now).unwrap_or(false) {
-                    return false;
-                }
-                // 如果是 opus 模型，需要检查订阅等级
-                if is_opus && !e.credentials.supports_opus() {
-                    return false;
-                }
-                // 账号分组隔离：Key 绑定分组时只用该分组内的账号
-                if !group_matches(&e.credentials.groups, group) {
-                    return false;
-                }
-                true
-            })
+            .filter(|e| Self::entry_is_available(e, is_opus, group, now))
+            .map(|e| e.id)
             .collect();
-
-        if available.is_empty() {
-            return None;
+        if available_ids.is_empty() {
+            return ReserveOutcome::Empty;
         }
 
-        let mode = self.load_balancing_mode.lock().clone();
-        let mode = mode.as_str();
+        // 第二步：在未满载候选里选号
+        let candidates: Vec<&CredentialEntry> = entries
+            .iter()
+            .filter(|e| available_ids.contains(&e.id) && !Self::is_full(e))
+            .collect();
 
-        match mode {
-            "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
-                let entry = available
-                    .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+        if candidates.is_empty() {
+            // 全部满载：挑一个"最闲"的可用凭据作为等待目标（前端 waiting 显示）
+            let wait_target = entries
+                .iter()
+                .filter(|e| available_ids.contains(&e.id))
+                .min_by_key(|e| (e.active, e.credentials.priority))
+                .map(|e| e.id);
+            return match wait_target {
+                Some(id) => ReserveOutcome::AllFull(id),
+                None => ReserveOutcome::Empty,
+            };
+        }
 
-                Some((entry.id, entry.credentials.clone()))
-            }
-            _ => {
-                // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
-                Some((entry.id, entry.credentials.clone()))
+        let chosen_id = if is_balanced {
+            let min_key = candidates
+                .iter()
+                .map(|e| (e.active, e.success_count))
+                .min()
+                .expect("candidates 非空");
+            let tied: Vec<u64> = candidates
+                .iter()
+                .filter(|e| (e.active, e.success_count) == min_key)
+                .map(|e| e.id)
+                .collect();
+            tied[fastrand::usize(0..tied.len())]
+        } else {
+            // priority：先锁定最高优先级档，再档内比 active
+            let min_priority = candidates
+                .iter()
+                .map(|e| e.credentials.priority)
+                .min()
+                .expect("candidates 非空");
+            let min_active = candidates
+                .iter()
+                .filter(|e| e.credentials.priority == min_priority)
+                .map(|e| e.active)
+                .min()
+                .expect("同档非空");
+            let tied: Vec<u64> = candidates
+                .iter()
+                .filter(|e| e.credentials.priority == min_priority && e.active == min_active)
+                .map(|e| e.id)
+                .collect();
+            tied[fastrand::usize(0..tied.len())]
+        };
+
+        let creds = {
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == chosen_id)
+                .expect("chosen_id 必然存在");
+            entry.active += 1;
+            entry.credentials.clone()
+        };
+        drop(entries);
+
+        ReserveOutcome::Reserved(chosen_id, creds, false, self.make_guard(chosen_id))
+    }
+
+    /// 尝试占用指定凭据的槽位（会话亲和命中用）。选号与 `active += 1` 同锁完成。
+    fn reserve_one(&self, id: u64, model: Option<&str>, group: Option<&str>) -> ReserveOne {
+        let is_opus = Self::model_is_opus(model);
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        let entry = match entries.iter_mut().find(|e| e.id == id) {
+            Some(e) => e,
+            None => return ReserveOne::Unavailable,
+        };
+        if !Self::entry_is_available(entry, is_opus, group, now) {
+            return ReserveOne::Unavailable;
+        }
+        if Self::is_full(entry) {
+            return ReserveOne::Full;
+        }
+        entry.active += 1;
+        let creds = entry.credentials.clone();
+        drop(entries);
+        ReserveOne::Ok(creds, self.make_guard(id))
+    }
+
+    /// 调整指定凭据的等待计数（前端 waiting 显示）。
+    fn adjust_waiting(&self, id: u64, increment: bool) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            if increment {
+                entry.waiting = entry.waiting.saturating_add(1);
+            } else {
+                entry.waiting = entry.waiting.saturating_sub(1);
             }
         }
     }
 
-    /// 获取 API 调用上下文
+    /// 读取指定凭据当前等待数（仅用于粘性过载阈值判断）。
+    fn waiting_count(&self, id: u64) -> u32 {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.waiting)
+            .unwrap_or(0)
+    }
+
+    fn is_balanced_mode(&self) -> bool {
+        self.load_balancing_mode.lock().as_str() == "balanced"
+    }
+
+    fn normalize_session_key(session_key: Option<&str>) -> Option<&str> {
+        session_key
+            .map(str::trim)
+            .and_then(|key| (!key.is_empty()).then_some(key))
+    }
+
+    fn prune_session_affinity_locked(map: &mut HashMap<String, SessionAffinityEntry>) {
+        let now = Instant::now();
+        map.retain(|_, entry| now.duration_since(entry.last_used_at) <= SESSION_AFFINITY_TTL);
+    }
+
+    /// 取会话绑定的凭据（若绑定号已不可用则清绑并返回 None）。
+    fn credential_for_session(
+        &self,
+        session_key: &str,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> Option<u64> {
+        let credential_id = {
+            let mut affinity = self.session_affinity.lock();
+            Self::prune_session_affinity_locked(&mut affinity);
+            affinity.get(session_key).map(|e| e.credential_id)
+        }?;
+
+        let is_opus = Self::model_is_opus(model);
+        let now = Instant::now();
+        let ok = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .any(|e| e.id == credential_id && Self::entry_is_available(e, is_opus, group, now))
+        };
+        if ok {
+            Some(credential_id)
+        } else {
+            self.clear_session_affinity(session_key);
+            None
+        }
+    }
+
+    fn remember_session_affinity(&self, session_key: &str, credential_id: u64) {
+        let mut affinity = self.session_affinity.lock();
+        Self::prune_session_affinity_locked(&mut affinity);
+        affinity.insert(
+            session_key.to_string(),
+            SessionAffinityEntry {
+                credential_id,
+                last_used_at: Instant::now(),
+            },
+        );
+    }
+
+    fn clear_session_affinity(&self, session_key: &str) {
+        self.session_affinity.lock().remove(session_key);
+    }
+
+    /// 清除所有绑定到指定凭据的会话亲和（凭据变不可用 / 改组时调用）。
+    fn clear_session_affinity_for_credential(&self, credential_id: u64) {
+        self.session_affinity
+            .lock()
+            .retain(|_, entry| entry.credential_id != credential_id);
+    }
+
+    /// 清除全部会话亲和（分组批量变更时调用）。
+    fn clear_all_session_affinity(&self) {
+        self.session_affinity.lock().clear();
+    }
+
+    /// 自愈：若存在因连续失败被自动禁用的凭据，重置其失败计数并重新启用。
+    /// 返回是否实际重新启用了凭据（用于避免自愈后仍 Empty 时的死循环）。
+    fn try_autoheal(&self) -> bool {
+        let mut entries = self.entries.lock();
+        let has_auto_disabled = entries
+            .iter()
+            .any(|e| e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures));
+        if !has_auto_disabled {
+            return false;
+        }
+        tracing::warn!("所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）");
+        for e in entries.iter_mut() {
+            if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                e.disabled = false;
+                e.disabled_reason = None;
+                e.failure_count = 0;
+            }
+        }
+        true
+    }
+
+    /// 获取 API 调用上下文（无会话粘性，等价于 `acquire_context_for_session(.., None)`）。
     ///
-    /// 返回绑定了 id、credentials 和 token 的调用上下文
-    /// 确保整个 API 调用过程中使用一致的凭据信息
-    ///
-    /// 如果 Token 过期或即将过期，会自动刷新
-    /// Token 刷新失败会累计到当前凭据，达到阈值后禁用并切换
-    ///
-    /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// 返回 `(CallContext, ConcurrencyGuard)`——**守卫必须由调用方持有到请求生命周期
+    /// 结束**（流式读到 stream_end / 非流式读完 body），drop 时自动释放在途槽位。
     pub async fn acquire_context(
         &self,
         model: Option<&str>,
         group: Option<&str>,
-    ) -> anyhow::Result<CallContext> {
+    ) -> anyhow::Result<(CallContext, ConcurrencyGuard)> {
+        self.acquire_context_for_session(model, group, None).await
+    }
+
+    /// 获取 API 调用上下文，并在 balanced 模式下按会话绑定凭据。
+    pub async fn acquire_context_for_session(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        session_key: Option<&str>,
+    ) -> anyhow::Result<(CallContext, ConcurrencyGuard)> {
+        let session_key = Self::normalize_session_key(session_key);
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1204,81 +1560,29 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
-
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
-                    None
-                } else {
-                    let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    let now = Instant::now();
-                    entries
-                        .iter()
-                        .find(|e| {
-                            e.id == current_id
-                                && !e.disabled
-                                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                && group_matches(&e.credentials.groups, group)
-                        })
-                        .map(|e| (e.id, e.credentials.clone()))
-                };
-
-                if let Some(hit) = current_hit {
-                    hit
-                } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, group);
-
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                    if best.is_none() {
-                        let mut entries = self.entries.lock();
-                        if entries.iter().any(|e| {
-                            e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
-                        }) {
-                            tracing::warn!(
-                                "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
-                            );
-                            for e in entries.iter_mut() {
-                                if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
-                                    e.disabled = false;
-                                    e.disabled_reason = None;
-                                    e.failure_count = 0;
-                                }
-                            }
-                            drop(entries);
-                            best = self.select_next_credential(model, group);
-                        }
-                    }
-
-                    if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
-                        (new_id, new_creds)
-                    } else {
-                        let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
-                    }
-                }
-            };
+            // 选号 + 原子占用槽位（含满载等待 / 粘性过载换号 / 自愈），返回 RAII 守卫
+            let (id, credentials, affinity_hit, guard) =
+                self.reserve_context(model, group, session_key).await?;
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
-                Ok(ctx) => {
-                    return Ok(ctx);
+                Ok(mut ctx) => {
+                    ctx.session_affinity_hit = affinity_hit;
+                    if self.is_balanced_mode() {
+                        if let Some(key) = session_key {
+                            self.remember_session_affinity(key, ctx.id);
+                        }
+                    }
+                    return Ok((ctx, guard));
                 }
                 Err(e) => {
+                    // 关键：先释放本轮预占的槽位，再报告失败，避免槽位泄漏 / 误判满载
+                    drop(guard);
+                    if let Some(key) = session_key {
+                        self.clear_session_affinity(key);
+                    }
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                        // 先尝试从源文件重新加载（适用于 IDE 退出后 token rotation 导致失效的场景）
                         if self.try_reload_credential_from_file(id) {
-                            // 找到新 Token，不计入失败次数，直接重试
                             continue;
                         }
                         tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
@@ -1295,6 +1599,130 @@ impl MultiTokenManager {
             }
         }
     }
+
+    /// 选号并原子占用槽位的完整流程：
+    /// 1. balanced + 命中会话亲和 → 占用绑定号；满载短等原号，超阈值/超时放弃换号。
+    /// 2. 其余 → reserve_best_with_wait：least-active + 满载短等 + 自愈。
+    ///
+    /// 铁律：sleep 期间绝不持 entries 锁（reserve_* 内部取锁、返回后才 sleep）。
+    async fn reserve_context(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        session_key: Option<&str>,
+    ) -> anyhow::Result<(u64, KiroCredentials, bool, ConcurrencyGuard)> {
+        if self.is_balanced_mode() {
+            if let Some(key) = session_key {
+                if let Some(bound_id) = self.credential_for_session(key, model, group) {
+                    match self.reserve_one(bound_id, model, group) {
+                        ReserveOne::Ok(creds, guard) => {
+                            return Ok((bound_id, creds, true, guard));
+                        }
+                        ReserveOne::Full => {
+                            if let Some(res) = self.wait_for_sticky(bound_id, model, group).await {
+                                return Ok(res);
+                            }
+                            self.clear_session_affinity(key);
+                        }
+                        ReserveOne::Unavailable => {
+                            self.clear_session_affinity(key);
+                        }
+                    }
+                }
+            }
+        }
+        self.reserve_best_with_wait(model, group).await
+    }
+
+    /// least-active 选号，满载时短等待重试，全灭时自愈。
+    async fn reserve_best_with_wait(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> anyhow::Result<(u64, KiroCredentials, bool, ConcurrencyGuard)> {
+        let total = self.total_count_in_group(group);
+        let deadline = Instant::now() + CONCURRENCY_WAIT_BUDGET;
+        let mut wait_target: Option<u64> = None;
+
+        loop {
+            match self.reserve_best(model, group) {
+                ReserveOutcome::Reserved(id, creds, hit, guard) => {
+                    if let Some(w) = wait_target.take() {
+                        self.adjust_waiting(w, false);
+                    }
+                    // current_id 统一更新为最近一次选中号（UI「活跃」标记）
+                    *self.current_id.lock() = id;
+                    return Ok((id, creds, hit, guard));
+                }
+                ReserveOutcome::AllFull(target) => {
+                    if wait_target != Some(target) {
+                        if let Some(w) = wait_target.take() {
+                            self.adjust_waiting(w, false);
+                        }
+                        self.adjust_waiting(target, true);
+                        wait_target = Some(target);
+                    }
+                    if Instant::now() >= deadline {
+                        if let Some(w) = wait_target.take() {
+                            self.adjust_waiting(w, false);
+                        }
+                        anyhow::bail!(
+                            "{}: 所有可用凭据并发已满（{}），请稍后重试",
+                            CONCURRENCY_BUSY_TAG,
+                            total
+                        );
+                    }
+                    tokio::time::sleep(CONCURRENCY_WAIT_POLL).await;
+                }
+                ReserveOutcome::Empty => {
+                    if let Some(w) = wait_target.take() {
+                        self.adjust_waiting(w, false);
+                    }
+                    if self.try_autoheal() {
+                        continue;
+                    }
+                    let available = self.available_count();
+                    anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                }
+            }
+        }
+    }
+
+    /// 粘性会话原号满载时的短等待。
+    /// 等到原号释放 → 返回原号（保缓存）；等待数达阈值或超时 → 返回 None（放弃亲和换号）。
+    async fn wait_for_sticky(
+        &self,
+        bound_id: u64,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> Option<(u64, KiroCredentials, bool, ConcurrencyGuard)> {
+        if self.waiting_count(bound_id) >= STICKY_MAX_WAITING {
+            return None;
+        }
+        self.adjust_waiting(bound_id, true);
+        let deadline = Instant::now() + CONCURRENCY_WAIT_BUDGET;
+
+        loop {
+            match self.reserve_one(bound_id, model, group) {
+                ReserveOne::Ok(creds, guard) => {
+                    self.adjust_waiting(bound_id, false);
+                    return Some((bound_id, creds, true, guard));
+                }
+                ReserveOne::Unavailable => {
+                    self.adjust_waiting(bound_id, false);
+                    return None;
+                }
+                ReserveOne::Full => {
+                    if Instant::now() >= deadline {
+                        self.adjust_waiting(bound_id, false);
+                        return None;
+                    }
+                    tokio::time::sleep(CONCURRENCY_WAIT_POLL).await;
+                }
+            }
+        }
+    }
+
 
     /// 选择优先级最高的未禁用凭据作为当前凭据（内部方法）
     ///
@@ -1343,6 +1771,7 @@ impl MultiTokenManager {
                 id,
                 credentials: credentials.clone(),
                 token,
+                session_affinity_hit: false,
             });
         }
 
@@ -1413,6 +1842,7 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            session_affinity_hit: false,
         })
     }
 
@@ -1716,6 +2146,7 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
+        let mut became_unavailable = false;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1745,6 +2176,7 @@ impl MultiTokenManager {
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
+                became_unavailable = true;
 
                 // 切换到优先级最高的可用凭据
                 if let Some(next) = entries
@@ -1765,6 +2197,10 @@ impl MultiTokenManager {
 
             entries.iter().any(|e| !e.disabled)
         };
+        // 仅当账号被自动禁用时清除其会话亲和，避免粘到坏号（瞬态失败不清，保持粘性）
+        if became_unavailable {
+            self.clear_session_affinity_for_credential(id);
+        }
         self.save_stats_debounced();
         result
     }
@@ -1819,6 +2255,7 @@ impl MultiTokenManager {
                 false
             }
         };
+        self.clear_session_affinity_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1882,6 +2319,7 @@ impl MultiTokenManager {
                 false
             }
         };
+        self.clear_session_affinity_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1930,6 +2368,7 @@ impl MultiTokenManager {
                 false
             }
         };
+        self.clear_session_affinity_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -2064,6 +2503,9 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
+                    max_concurrency: e.credentials.max_concurrency,
+                    active_concurrency: e.active,
+                    waiting_concurrency: e.waiting,
                 })
                 .collect(),
             current_id,
@@ -2091,6 +2533,8 @@ impl MultiTokenManager {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
         }
+        // 禁用后清绑（启用后亦清，让会话重新走 least-active 选号）
+        self.clear_session_affinity_for_credential(id);
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
@@ -2104,7 +2548,7 @@ impl MultiTokenManager {
     /// 返回剩余可用凭据数（已排除冷却中的）。
     pub fn report_account_throttled(&self, id: u64, cooldown: StdDuration) -> usize {
         let now = Instant::now();
-        {
+        let remaining = {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 let until = now + cooldown;
@@ -2133,7 +2577,10 @@ impl MultiTokenManager {
                             .unwrap_or(false)
                 })
                 .count()
-        }
+        };
+        // 冷却中的号暂不可用：清除其会话亲和，避免粘到冷却号
+        self.clear_session_affinity_for_credential(id);
+        remaining
     }
 
     /// 手动解除指定凭据的临时冷却（Admin API）
@@ -2163,6 +2610,7 @@ impl MultiTokenManager {
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
         }
+        self.clear_session_affinity_for_credential(id);
         self.persist_credentials()?;
         Ok(())
     }
@@ -2205,9 +2653,43 @@ impl MultiTokenManager {
             entry.disabled_reason = None;
             entry.throttled_until = None;
         }
+        // 状态变更：清绑，让会话重新选号
+        self.clear_session_affinity_for_credential(id);
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
+    }
+
+    /// 设置单个凭据的并发硬上限（Admin API，0 = 不限制）。运行时态 active/waiting 不变。
+    pub fn set_max_concurrency(&self, id: u64, max: u32) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.max_concurrency = max;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 批量设置并发硬上限（Admin API）。返回实际命中的凭据数。
+    pub fn set_max_concurrency_batch(&self, ids: &[u64], max: u32) -> anyhow::Result<usize> {
+        let mut affected = 0usize;
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                if ids.contains(&entry.id) {
+                    entry.credentials.max_concurrency = max;
+                    affected += 1;
+                }
+            }
+        }
+        if affected > 0 {
+            self.persist_credentials()?;
+        }
+        Ok(affected)
     }
 
     pub fn reset_success_count(&self, id: Option<u64>) -> anyhow::Result<u32> {
@@ -2754,6 +3236,8 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 throttled_until: None,
+                active: 0,
+                waiting: 0,
             });
         }
 
@@ -2778,7 +3262,9 @@ impl MultiTokenManager {
         proxy_password: Option<Option<String>>,
         groups: Option<Vec<String>>,
         source_channel: Option<Option<String>>,
+        max_concurrency: Option<u32>,
     ) -> anyhow::Result<()> {
+        let groups_changed = groups.is_some();
         {
             let mut entries = self.entries.lock();
             let entry = entries
@@ -2809,6 +3295,13 @@ impl MultiTokenManager {
                 entry.credentials.source_channel =
                     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             }
+            if let Some(max) = max_concurrency {
+                entry.credentials.max_concurrency = max;
+            }
+        }
+        // 分组变更可能让该号脱离当前会话所属分组：清绑
+        if groups_changed {
+            self.clear_session_affinity_for_credential(id);
         }
         self.persist_credentials()?;
         Ok(())
@@ -2874,6 +3367,8 @@ impl MultiTokenManager {
             }
         }
         if affected > 0 {
+            // 分组变更改变了账号分组归属：清空全部会话亲和，避免跨组粘性错位
+            self.clear_all_session_affinity();
             self.persist_credentials()?;
         }
         Ok(affected)
@@ -2894,6 +3389,8 @@ impl MultiTokenManager {
             }
         }
         if affected > 0 {
+            // 分组变更改变了账号分组归属：清空全部会话亲和，避免跨组粘性错位
+            self.clear_all_session_affinity();
             self.persist_credentials()?;
         }
         Ok(affected)
@@ -2939,6 +3436,8 @@ impl MultiTokenManager {
         if was_current {
             self.select_highest_priority();
         }
+        // 删除后清除该号的会话亲和
+        self.clear_session_affinity_for_credential(id);
 
         // 如果删除后没有任何凭据，将 current_id 重置为 0（与初始化行为保持一致）
         {
@@ -3604,7 +4103,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None, None).await.unwrap();
+        let (ctx, _guard) = manager.acquire_context(None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -3627,7 +4126,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None, None).await.unwrap();
+        let (ctx, _guard) = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -4198,15 +4697,15 @@ mod tests {
         .unwrap();
 
         // g1 只能选到 A(id=1)
-        let g1 = manager.select_next_credential(None, Some("g1"));
-        assert_eq!(g1.map(|(id, _)| id), Some(1));
+        let g1 = manager.pick_credential_id(None, Some("g1"));
+        assert_eq!(g1, Some(1));
         // g2 只能选到 B(id=2)
-        let g2 = manager.select_next_credential(None, Some("g2"));
-        assert_eq!(g2.map(|(id, _)| id), Some(2));
+        let g2 = manager.pick_credential_id(None, Some("g2"));
+        assert_eq!(g2, Some(2));
         // 不存在的分组 → 无可用账号
-        assert!(manager.select_next_credential(None, Some("nope")).is_none());
+        assert!(manager.pick_credential_id(None, Some("nope")).is_none());
         // 未绑定分组(None) → 可选到账号
-        assert!(manager.select_next_credential(None, None).is_some());
+        assert!(manager.pick_credential_id(None, None).is_some());
     }
 
     #[test]
@@ -4251,15 +4750,15 @@ mod tests {
         // 让 A(id1) 成功若干次 → balanced 应转向 success_count 更小的 B(id2)
         manager.report_success(1);
         manager.report_success(1);
-        let pick = manager.select_next_credential(None, Some("g1"));
+        let pick = manager.pick_credential_id(None, Some("g1"));
         assert_eq!(
-            pick.map(|(id, _)| id),
+            pick,
             Some(2),
             "balanced 应在 g1 内选 success_count 最小的 B"
         );
         // g2 不受 g1 计数影响，仍只会选到 C(id3)
-        let pick_g2 = manager.select_next_credential(None, Some("g2"));
-        assert_eq!(pick_g2.map(|(id, _)| id), Some(3));
+        let pick_g2 = manager.pick_credential_id(None, Some("g2"));
+        assert_eq!(pick_g2, Some(3));
     }
 
     #[tokio::test]
@@ -4290,5 +4789,168 @@ mod tests {
 
         // 但 g2 仍可用
         assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
+    }
+
+    // ===== 并发调度中心回归测试 =====
+
+    /// 构造一个 Arc 管理器（已 init_weak_self），N 个可用凭据，指定负载均衡模式。
+    fn concurrency_manager(n: usize, mode: &str) -> Arc<MultiTokenManager> {
+        let mut config = Config::default();
+        config.load_balancing_mode = mode.to_string();
+        let creds: Vec<KiroCredentials> = (0..n)
+            .map(|i| grouped_cred(&format!("t{}", i + 1), &[]))
+            .collect();
+        let manager = Arc::new(MultiTokenManager::new(config, creds, None, None, false).unwrap());
+        manager.init_weak_self();
+        manager
+    }
+
+    #[tokio::test]
+    async fn test_balanced_spreads_active_across_accounts() {
+        let manager = concurrency_manager(5, "balanced");
+        let mut guards = Vec::new();
+        for _ in 0..5 {
+            let (_ctx, guard) = manager.acquire_context(None, None).await.unwrap();
+            guards.push(guard);
+        }
+        // 不释放，5 个账号各应在途 1
+        for id in 1..=5u64 {
+            assert_eq!(manager.active_count(id), 1, "账号 #{} 应均摊到 active=1", id);
+        }
+        drop(guards);
+        for id in 1..=5u64 {
+            assert_eq!(manager.active_count(id), 0, "guard drop 后账号 #{} active 应归零", id);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_guard_drop_releases_slot() {
+        let manager = concurrency_manager(1, "balanced");
+        {
+            let (_ctx, _guard) = manager.acquire_context(None, None).await.unwrap();
+            assert_eq!(manager.active_count(1), 1);
+        }
+        // 作用域结束 guard drop
+        assert_eq!(manager.active_count(1), 0);
+    }
+
+    #[tokio::test]
+    async fn test_priority_never_picks_lower_tier_when_unlimited() {
+        // id1 priority=0, id2 priority=1，均不限并发 → 永远只选 id1
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+        let mut hi = grouped_cred("hi", &[]);
+        hi.priority = 0;
+        let mut lo = grouped_cred("lo", &[]);
+        lo.priority = 1;
+        let manager = Arc::new(MultiTokenManager::new(config, vec![hi, lo], None, None, false).unwrap());
+        manager.init_weak_self();
+
+        let mut guards = Vec::new();
+        for _ in 0..5 {
+            let (ctx, guard) = manager.acquire_context(None, None).await.unwrap();
+            assert_eq!(ctx.id, 1, "maxConcurrency=0 时永不选低优先级档");
+            guards.push(guard);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_max_concurrency_busy_when_full() {
+        // 单账号 maxConcurrency=1：占住后第二个请求短等 2s 后返回 CONCURRENCY_BUSY
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let mut c = grouped_cred("only", &[]);
+        c.max_concurrency = 1;
+        let manager = Arc::new(MultiTokenManager::new(config, vec![c], None, None, false).unwrap());
+        manager.init_weak_self();
+
+        let (_ctx, _guard) = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(manager.active_count(1), 1);
+        // 第二个请求：满载等待超时
+        let err = manager
+            .acquire_context(None, None)
+            .await
+            .err()
+            .expect("满载应返回错误")
+            .to_string();
+        assert!(
+            err.contains(CONCURRENCY_BUSY_TAG),
+            "满载超时应返回 CONCURRENCY_BUSY，实际: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_priority_falls_to_lower_tier_when_high_tier_full() {
+        // id1 priority=0 maxConcurrency=1；id2 priority=1 空闲。
+        // 占住 id1 后再选 → 应落到 id2，而不是 CONCURRENCY_BUSY。
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+        let mut hi = grouped_cred("hi", &[]);
+        hi.priority = 0;
+        hi.max_concurrency = 1;
+        let mut lo = grouped_cred("lo", &[]);
+        lo.priority = 1;
+        let manager = Arc::new(MultiTokenManager::new(config, vec![hi, lo], None, None, false).unwrap());
+        manager.init_weak_self();
+
+        let (ctx1, _g1) = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx1.id, 1, "首选最高优先级档");
+        let (ctx2, _g2) = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx2.id, 2, "高档满载应落到低优先级档，而非繁忙");
+    }
+
+    #[tokio::test]
+    async fn test_session_affinity_hit_same_account() {
+        let manager = concurrency_manager(5, "balanced");
+        let key = Some("sess-abc");
+        let (ctx1, g1) = manager
+            .acquire_context_for_session(None, None, key)
+            .await
+            .unwrap();
+        let first_id = ctx1.id;
+        drop(g1);
+        // 同会话再次请求应命中同一账号
+        let (ctx2, _g2) = manager
+            .acquire_context_for_session(None, None, key)
+            .await
+            .unwrap();
+        assert_eq!(ctx2.id, first_id, "同会话应粘到同一账号");
+        assert!(ctx2.session_affinity_hit, "第二次应标记命中会话亲和");
+    }
+
+    #[tokio::test]
+    async fn test_session_affinity_cleared_on_disable() {
+        let manager = concurrency_manager(3, "balanced");
+        let key = Some("sess-x");
+        let (ctx1, g1) = manager
+            .acquire_context_for_session(None, None, key)
+            .await
+            .unwrap();
+        let bound = ctx1.id;
+        drop(g1);
+        // 禁用绑定号 → 清绑，下次换号
+        manager.set_disabled(bound, true).unwrap();
+        let (ctx2, _g2) = manager
+            .acquire_context_for_session(None, None, key)
+            .await
+            .unwrap();
+        assert_ne!(ctx2.id, bound, "绑定号禁用后应换到其它账号");
+        assert!(!ctx2.session_affinity_hit, "换号后不应标记命中亲和");
+    }
+
+    #[tokio::test]
+    async fn test_token_refresh_failure_does_not_leak_active() {
+        // 选号占槽后 token 刷新失败（无有效 token 且无法刷新）→ active 必须回到 0
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        // 一个会刷新失败的 OAuth 凭据（无 access_token、无 refresh 能力）
+        let mut bad = KiroCredentials::default();
+        bad.refresh_token = Some("invalid".to_string());
+        let manager = Arc::new(MultiTokenManager::new(config, vec![bad], None, None, false).unwrap());
+        manager.init_weak_self();
+
+        let _ = manager.acquire_context(None, None).await; // 预期失败
+        assert_eq!(manager.active_count(1), 0, "刷新失败分支必须释放预占槽位");
     }
 }

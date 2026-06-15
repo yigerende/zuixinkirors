@@ -16,7 +16,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{ConcurrencyGuard, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -86,6 +86,10 @@ impl ClientCache {
 pub struct KiroCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    /// 本次是否命中会话亲和（仅日志展示）
+    pub session_affinity_hit: bool,
+    /// 并发槽位守卫：必须由调用方持有到请求生命周期结束，drop 时释放在途槽位
+    pub slot_guard: ConcurrencyGuard,
 }
 
 /// Kiro API Provider
@@ -237,8 +241,9 @@ impl KiroProvider {
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        session_key: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink, group)
+        self.call_api_with_retry(request_body, false, sink, group, session_key)
             .await
     }
 
@@ -248,8 +253,9 @@ impl KiroProvider {
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        session_key: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group)
+        self.call_api_with_retry(request_body, true, sink, group, session_key)
             .await
     }
 
@@ -266,8 +272,9 @@ impl KiroProvider {
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
-            // MCP 调用（WebSearch 等工具）不涉及模型选择，也不参与分组隔离
-            let ctx = match self.token_manager.acquire_context(None, None).await {
+            // MCP 调用（WebSearch 等工具）不涉及模型选择，也不参与分组隔离、不做粘性。
+            // _slot_guard 本地持有到本次迭代结束（continue/return）即自动释放在途槽位。
+            let (ctx, _slot_guard) = match self.token_manager.acquire_context(None, None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -426,6 +433,7 @@ impl KiroProvider {
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        session_key: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
@@ -439,14 +447,21 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
-            // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match self
+            // 获取调用上下文 + 并发槽位守卫。slot_guard 是本次循环迭代的局部变量：
+            // 成功时随 KiroCallResult 透传到 handler 持有到流读完；任何 continue
+            // （429 退避 / 402 切号 / 网络错误）时作为局部变量自动 drop，释放旧凭据槽位。
+            let (mut ctx, slot_guard) = match self
                 .token_manager
-                .acquire_context(model.as_deref(), group)
+                .acquire_context_for_session(model.as_deref(), group, session_key)
                 .await
             {
                 Ok(c) => c,
                 Err(e) => {
+                    // 并发繁忙（所有可用凭据在途已满）：内部已等过 2s，重试只会叠加更多
+                    // 等待且大概率仍满载，直接返回让 handler 映射 429。
+                    if e.to_string().contains(crate::kiro::token_manager::CONCURRENCY_BUSY_TAG) {
+                        return Err(e);
+                    }
                     Self::emit_attempt(
                         sink,
                         attempt,
@@ -565,6 +580,8 @@ impl KiroProvider {
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
+                    session_affinity_hit: ctx.session_affinity_hit,
+                    slot_guard,
                 });
             }
 

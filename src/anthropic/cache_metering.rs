@@ -550,7 +550,10 @@ fn isolation_seed(req: &MessagesRequest, key_id: u64) -> String {
 ///
 /// 格式形如 `user_<hash>_account__session_<uuid>`，取 `_session_` 之后的部分。
 /// 不含该标记时返回 None（交由调用方退回 key_id）。
-fn extract_session_id(user_id: &str) -> Option<String> {
+///
+/// `pub(crate)`：会话粘性调度（token_manager / handlers）复用同一套提取逻辑，
+/// 保证缓存隔离种子与粘性 session key 同源。
+pub(crate) fn extract_session_id(user_id: &str) -> Option<String> {
     user_id
         .split_once("_session_")
         .map(|(_, sid)| sid.trim().to_string())

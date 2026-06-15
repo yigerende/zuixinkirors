@@ -25,7 +25,8 @@ use super::types::{
     CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
     GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
-    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
+    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult,
+    SetAccountThrottleConfigRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetUpdateConfigRequest,
     StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
     UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -558,6 +559,9 @@ impl AdminService {
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
+                    max_concurrency: entry.max_concurrency,
+                    active_concurrency: entry.active_concurrency,
+                    waiting_concurrency: entry.waiting_concurrency,
                     balance,
                     balance_updated_at,
                 }
@@ -680,6 +684,24 @@ impl AdminService {
         self.token_manager
             .set_priority(id, priority)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置单个凭据的并发硬上限（0 = 不限制）
+    pub fn set_max_concurrency(&self, id: u64, max: u32) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_max_concurrency(id, max)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 批量设置并发硬上限，返回命中的凭据数
+    pub fn set_max_concurrency_batch(
+        &self,
+        ids: &[u64],
+        max: u32,
+    ) -> Result<usize, AdminServiceError> {
+        self.token_manager
+            .set_max_concurrency_batch(ids, max)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))
     }
 
     /// 重置失败计数并重新启用
@@ -1011,6 +1033,7 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
+            max_concurrency: req.max_concurrency,
         };
 
         // 调用 token_manager 添加凭据
@@ -1053,6 +1076,7 @@ impl AdminService {
                 req.groups,
                 req.source_channel
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
+                req.max_concurrency,
             )
             .map_err(|e| self.classify_error(e, id))
     }
@@ -2155,6 +2179,7 @@ impl AdminService {
                 None,            // proxy_password 不修改
                 None,            // groups 不修改
                 None,            // source_channel 不修改
+                None,            // max_concurrency 不修改
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -2224,7 +2249,7 @@ impl AdminService {
             let url = urls[i % urls.len()].clone();
             if self
                 .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None)
+                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None, None)
                 .is_ok()
             {
                 assigned += 1;

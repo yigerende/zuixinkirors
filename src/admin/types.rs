@@ -74,6 +74,12 @@ pub struct CredentialStatusItem {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 并发硬上限（0 = 不限制）
+    pub max_concurrency: u32,
+    /// 当前在途请求数
+    pub active_concurrency: u32,
+    /// 当前等待该凭据释放槽位的请求数
+    pub waiting_concurrency: u32,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,
@@ -98,6 +104,24 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 设置单个凭据并发上限请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConcurrencyRequest {
+    /// 并发硬上限（0 = 不限制）
+    pub max_concurrency: u32,
+}
+
+/// 批量设置并发上限请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConcurrencyBatchRequest {
+    /// 目标凭据 ID 列表
+    pub ids: Vec<u64>,
+    /// 并发硬上限（0 = 不限制）
+    pub max_concurrency: u32,
 }
 
 /// 添加凭据请求
@@ -182,6 +206,9 @@ pub struct AddCredentialRequest {
     /// 账号来源渠道（纯备注，可选）
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// 并发硬上限（可选，0 = 不限制，默认 0）
+    #[serde(default)]
+    pub max_concurrency: u32,
 }
 
 fn default_auth_method() -> String {
@@ -220,6 +247,9 @@ pub struct UpdateCredentialRequest {
     /// 账号来源渠道（None 表示不修改，空串表示清除）
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// 并发硬上限（None 表示不修改；Some(0) = 不限制，Some(>0) = 上限）
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
 }
 
 /// 添加凭据成功响应
@@ -842,6 +872,10 @@ pub struct ExportedCredentials {
 /// 账号导出文件中的单个账号（嵌套 `Account` 结构）
 ///
 /// 账号字段位于顶层，凭据收进嵌套 `credentials` 对象，便于第三方账号管理工具直接导入。
+///
+/// 注：`max_concurrency` 是本服务私有的运行时调度配置，**不纳入** KAM 互操作导出格式
+/// （避免污染第三方 schema）。导出/导入后该上限重置为默认值 0（不限制），需在本服务
+/// 管理面板重新设置。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportedAccount {

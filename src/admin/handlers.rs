@@ -18,7 +18,8 @@ use super::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
         CreateClientKeyRequest, CreateClientKeyResponse, GlobalProxyResponse,
-        SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
+        SetAccountThrottleConfigRequest, SetConcurrencyBatchRequest, SetConcurrencyRequest,
+        SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
@@ -110,6 +111,42 @@ pub async fn set_credential_priority(
         Ok(_) => Json(SuccessResponse::new(format!(
             "凭据 #{} 优先级已设置为 {}",
             id, payload.priority
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/concurrency
+/// 设置单个凭据的并发硬上限（0 = 不限制）
+pub async fn set_credential_concurrency(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetConcurrencyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_max_concurrency(id, payload.max_concurrency) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 并发上限已设置为 {}",
+            id, payload.max_concurrency
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/concurrency/batch
+/// 批量设置并发硬上限
+pub async fn set_credential_concurrency_batch(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetConcurrencyBatchRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_max_concurrency_batch(&payload.ids, payload.max_concurrency)
+    {
+        Ok(affected) => Json(SuccessResponse::new(format!(
+            "已为 {} 个凭据设置并发上限 {}",
+            affected, payload.max_concurrency
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),

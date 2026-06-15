@@ -88,6 +88,7 @@ import {
   useSetLoadBalancingMode,
   useResetAllSuccessCount,
   useSetPriority,
+  useSetConcurrencyBatch,
 } from "@/hooks/use-credentials";
 import { useUpdateCheck } from "@/hooks/use-update-check";
 import { useFailureStats } from "@/hooks/use-traces";
@@ -191,6 +192,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const { data, isLoading, error, refetch } = useCredentials();
   const { mutate: deleteCredential } = useDeleteCredential();
   const { mutate: resetFailure } = useResetFailure();
+  const { mutateAsync: setConcurrencyBatch } = useSetConcurrencyBatch();
   const { data: loadBalancingData, isLoading: isLoadingMode } =
     useLoadBalancingMode();
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } =
@@ -342,6 +344,48 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const overageEnableableCount = overageStats.disabledOff;
   const overageRetryableCount = overageStats.disabledOff + overageStats.unknown;
 
+  // 凭据聚合统计：用于顶部统计卡片
+  const credStats = (() => {
+    const creds = data?.credentials || [];
+    let disabled = 0;
+    let throttled = 0;
+    let active = 0;
+    let waiting = 0;
+    let withLimit = 0;
+    let totalSuccess = 0;
+    let totalFailure = 0;
+    let proxied = 0;
+    let oauth = 0;
+    let apiKey = 0;
+    const groupSet = new Set<string>();
+    for (const c of creds) {
+      if (c.disabled) disabled += 1;
+      if ((c.throttledRemainingSecs ?? 0) > 0) throttled += 1;
+      active += c.activeConcurrency ?? 0;
+      waiting += c.waitingConcurrency ?? 0;
+      if ((c.maxConcurrency ?? 0) > 0) withLimit += 1;
+      totalSuccess += c.successCount ?? 0;
+      totalFailure += c.totalFailureCount ?? 0;
+      if (c.hasProxy) proxied += 1;
+      if (c.authMethod === "api_key") apiKey += 1;
+      else oauth += 1;
+      for (const g of c.groups ?? []) if (g) groupSet.add(g);
+    }
+    return {
+      disabled,
+      throttled,
+      active,
+      waiting,
+      withLimit,
+      totalSuccess,
+      totalFailure,
+      proxied,
+      oauth,
+      apiKey,
+      groups: groupSet.size,
+    };
+  })();
+
   useEffect(() => {
     setCurrentPage(1);
   }, [data?.credentials.length]);
@@ -452,6 +496,32 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     if (f === 0) toast.success(`成功删除 ${s} 个凭据`);
     else toast.warning(`删除凭据：成功 ${s} 个，失败 ${f} 个`);
     deselectAll();
+  };
+
+  const handleBatchConcurrency = async () => {
+    if (selectedIds.size === 0) {
+      toast.error("请先选择要设置的凭据");
+      return;
+    }
+    const input = window.prompt(
+      "设置选中凭据的并发上限（0 = 不限制）",
+      "0",
+    );
+    if (input === null) return;
+    const max = parseInt(input.trim(), 10);
+    if (isNaN(max) || max < 0) {
+      toast.error("并发上限必须是非负整数");
+      return;
+    }
+    try {
+      const res = await setConcurrencyBatch({
+        ids: Array.from(selectedIds),
+        maxConcurrency: max,
+      });
+      toast.success(res.message);
+    } catch (err) {
+      toast.error("批量设置失败: " + (err as Error).message);
+    }
   };
 
   const handleBatchResetFailure = async () => {
@@ -1059,7 +1129,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         </div>
 
         {/* 统计卡片 */}
-        <div className="mb-5 grid grid-cols-3 gap-2 sm:mb-6 sm:gap-4">
+        <div className="mb-5 grid grid-cols-2 gap-2 sm:mb-6 sm:gap-4 lg:grid-cols-4">
           <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
             <CardContent className="p-3 sm:p-5">
               <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
@@ -1077,6 +1147,90 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </div>
               <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400 sm:mt-2 sm:text-3xl">
                 {formatNumber(data?.available)}
+              </div>
+            </CardContent>
+          </Card>
+          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
+            <CardContent className="p-3 sm:p-5">
+              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
+                禁用 / 风控
+              </div>
+              <div className="mt-1.5 flex items-baseline gap-1 sm:mt-2">
+                <span className="text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
+                  <span className={credStats.disabled > 0 ? "text-destructive" : ""}>
+                    {credStats.disabled}
+                  </span>
+                  <span className="text-base text-muted-foreground/50"> / </span>
+                  <span className={credStats.throttled > 0 ? "text-amber-600 dark:text-amber-400" : ""}>
+                    {credStats.throttled}
+                  </span>
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
+            <CardContent className="p-3 sm:p-5">
+              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
+                在途 / 等待
+              </div>
+              <div className="mt-1.5 flex items-baseline gap-1 sm:mt-2">
+                <span className="text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
+                  <span className={credStats.active > 0 ? "text-primary" : ""}>
+                    {credStats.active}
+                  </span>
+                  <span className="text-base text-muted-foreground/50"> / </span>
+                  <span className={credStats.waiting > 0 ? "text-amber-600 dark:text-amber-400" : ""}>
+                    {credStats.waiting}
+                  </span>
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
+            <CardContent className="p-3 sm:p-5">
+              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
+                成功 / 失败
+              </div>
+              <div className="mt-1.5 flex items-baseline gap-1 sm:mt-2">
+                <span className="text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
+                  <span className="text-emerald-600 dark:text-emerald-400">
+                    {formatNumber(credStats.totalSuccess)}
+                  </span>
+                  <span className="text-base text-muted-foreground/50"> / </span>
+                  <span className={credStats.totalFailure > 0 ? "text-destructive" : ""}>
+                    {formatNumber(credStats.totalFailure)}
+                  </span>
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
+            <CardContent className="p-3 sm:p-5">
+              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
+                OAuth / APIKey
+              </div>
+              <div className="mt-1.5 flex items-baseline gap-1 sm:mt-2">
+                <span className="text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
+                  {credStats.oauth}
+                  <span className="text-base text-muted-foreground/50"> / </span>
+                  {credStats.apiKey}
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
+            <CardContent className="p-3 sm:p-5">
+              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
+                代理 / 分组 / 限并发
+              </div>
+              <div className="mt-1.5 flex items-baseline gap-1 sm:mt-2">
+                <span className="text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
+                  {credStats.proxied}
+                  <span className="text-base text-muted-foreground/50"> / </span>
+                  {credStats.groups}
+                  <span className="text-base text-muted-foreground/50"> / </span>
+                  {credStats.withLimit}
+                </span>
               </div>
             </CardContent>
           </Card>
@@ -1199,6 +1353,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 >
                   <Tags className="h-3.5 w-3.5" />
                   分组/来源
+                </Button>
+                <Button
+                  onClick={handleBatchConcurrency}
+                  size="sm"
+                  variant="outline"
+                  title="批量设置选中凭据的并发上限（0 = 不限制）"
+                >
+                  并发上限
                 </Button>
                 <Button
                   onClick={handleExportKam}

@@ -344,6 +344,19 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
 pub(super) fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
 
+    // 并发繁忙：所有可用凭据在途已满（第二层硬上限兜底），映射为 429 让客户端稍后重试
+    if err_str.contains(crate::kiro::token_manager::CONCURRENCY_BUSY_TAG) {
+        tracing::warn!(error = %err, "并发繁忙：所有可用凭据在途已满");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "All credentials are at maximum concurrency. Please retry shortly.",
+            )),
+        )
+            .into_response();
+    }
+
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
@@ -685,6 +698,12 @@ pub async fn post_messages(
         }
     };
 
+    // 计算会话粘性 key（必须在 conversation_state 被 move 进 kiro_request 之前）。
+    let session_key = compute_session_key(
+        &payload,
+        Some(conversion_result.conversation_state.conversation_id.as_str()),
+    );
+
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
     let kiro_request = KiroRequest {
@@ -761,6 +780,7 @@ pub async fn post_messages(
             tracer,
             key_ctx.group.clone(),
             key_ctx.key_id,
+            session_key,
         )
         .await
     } else {
@@ -788,6 +808,7 @@ pub async fn post_messages(
             tracer,
             key_ctx.group.clone(),
             key_ctx.key_id,
+            session_key,
         )
         .await
     }
@@ -808,10 +829,11 @@ async fn handle_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     key_id: u64,
+    session_key: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref(), session_key.as_deref())
         .await
     {
         Ok(resp) => resp,
@@ -842,6 +864,11 @@ async fn handle_stream_request(
     ctx.cache_usage = cache_usage;
     ctx.cache_optimizer = Some(cache_optimizer);
     ctx.key_id = key_id;
+    if call_result.session_affinity_hit {
+        tracing::debug!(credential_id, "命中会话亲和（流式）");
+    }
+    // guard 随流活到读完 / 出错 / 断开，drop 时释放在途槽位
+    ctx.slot_guard = Some(call_result.slot_guard);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1048,10 +1075,11 @@ async fn handle_non_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     key_id: u64,
+    session_key: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api(request_body, Some(tracer.as_ref()), group.as_deref(), session_key.as_deref())
         .await
     {
         Ok(resp) => resp,
@@ -1069,6 +1097,11 @@ async fn handle_non_stream_request(
     };
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+    if call_result.session_affinity_hit {
+        tracing::debug!(credential_id, "命中会话亲和（非流式）");
+    }
+    // 非流式：guard 本地持有到 body 读完 + 响应构造完成，函数返回时 drop 释放槽位
+    let _slot_guard = call_result.slot_guard;
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -1373,6 +1406,32 @@ fn build_non_stream_content(
     content
 }
 
+/// 计算会话粘性 key（balanced 模式下用于把同一会话绑定到同一账号）。
+///
+/// 优先级（见实施计划阶段三 Q2）：
+/// 1. 客户端 session 标识：`MessagesRequest.metadata.user_id` 里的 `_session_<uuid>`，
+///    跨轮稳定，复用 cache_metering 的同一套提取逻辑。
+/// 2. 兜底：转换后的 `conversationState.conversationId`。
+///
+/// provider 收到的 request_body 已丢失原始 metadata，故必须在此（持有 payload 时）算好传入。
+pub(crate) fn compute_session_key(
+    payload: &MessagesRequest,
+    conversation_id: Option<&str>,
+) -> Option<String> {
+    if let Some(session) = payload
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref())
+        .and_then(super::cache_metering::extract_session_id)
+    {
+        return Some(session);
+    }
+    conversation_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
 /// - Opus 4.6：覆写为 adaptive 类型
@@ -1532,6 +1591,12 @@ pub async fn post_messages_cc(
         }
     };
 
+    // 计算会话粘性 key（必须在 conversation_state 被 move 进 kiro_request 之前）。
+    let session_key = compute_session_key(
+        &payload,
+        Some(conversion_result.conversation_state.conversation_id.as_str()),
+    );
+
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
     let kiro_request = KiroRequest {
@@ -1607,6 +1672,7 @@ pub async fn post_messages_cc(
             tracer,
             key_ctx.group.clone(),
             key_ctx.key_id,
+            session_key,
         )
         .await
     } else {
@@ -1634,6 +1700,7 @@ pub async fn post_messages_cc(
             tracer,
             key_ctx.group.clone(),
             key_ctx.key_id,
+            session_key,
         )
         .await
     }
@@ -1657,10 +1724,11 @@ async fn handle_stream_request_buffered(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     key_id: u64,
+    session_key: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref(), session_key.as_deref())
         .await
     {
         Ok(resp) => resp,
@@ -1690,6 +1758,11 @@ async fn handle_stream_request_buffered(
     ctx.set_cache_usage(cache_usage);
     ctx.set_cache_optimizer(cache_optimizer);
     ctx.set_key_id(key_id);
+    if call_result.session_affinity_hit {
+        tracing::debug!(credential_id, "命中会话亲和（缓冲流式）");
+    }
+    // guard 随缓冲流活到读完 / 出错 / 断开
+    ctx.set_slot_guard(call_result.slot_guard);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);

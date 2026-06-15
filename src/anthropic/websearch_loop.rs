@@ -224,6 +224,12 @@ async fn run_round(
         }
     };
 
+    // 会话粘性 key（metadata session 优先，兜底 conversationId）——必须在 move 前算好
+    let session_key = super::handlers::compute_session_key(
+        payload,
+        Some(conversion.conversation_state.conversation_id.as_str()),
+    );
+
     let kiro_request = KiroRequest {
         conversation_state: conversion.conversation_state,
         profile_arn: None,
@@ -244,7 +250,10 @@ async fn run_round(
         }
     };
 
-    let call_result = match provider.call_api_stream(&request_body, None, group).await {
+    let call_result = match provider
+        .call_api_stream(&request_body, None, group, session_key.as_deref())
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
@@ -252,6 +261,8 @@ async fn run_round(
         }
     };
     let credential_id = call_result.credential_id;
+    // guard 必须持有到 decode_round 读完整个上游流，否则槽位释放过早
+    let _slot_guard = call_result.slot_guard;
     let mut outcome = decode_round(
         call_result.response,
         &payload.model,

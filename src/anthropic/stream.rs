@@ -1102,6 +1102,9 @@ pub struct StreamContext {
     repeat_guard_run: u32,
     /// 复读熔断：是否已经触发过熔断（触发后本轮后续文本一律丢弃，不再吐、不写历史）。
     repeat_guard_tripped: bool,
+    /// 并发槽位守卫：随响应流活到流读完 / 出错 / 断开，drop 时释放在途槽位。
+    /// 仅 move 持有，流转过程零开销（不参与任何 per-chunk 计算）。
+    pub slot_guard: Option<crate::kiro::token_manager::ConcurrencyGuard>,
 }
 
 impl StreamContext {
@@ -1171,6 +1174,7 @@ impl StreamContext {
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
+            slot_guard: None,
         }
     }
 
@@ -2234,6 +2238,11 @@ impl BufferedStreamContext {
     /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
     pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
         self.inner.cache_usage = cache_usage;
+    }
+
+    /// 注入并发槽位守卫：随缓冲流活到读完 / 出错 / 断开，drop 时释放在途槽位。
+    pub fn set_slot_guard(&mut self, guard: crate::kiro::token_manager::ConcurrencyGuard) {
+        self.inner.slot_guard = Some(guard);
     }
 
     pub fn set_cache_optimizer(

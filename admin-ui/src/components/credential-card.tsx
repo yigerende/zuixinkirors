@@ -43,6 +43,7 @@ import { maskProxyUrl, extractErrorMessage, overageFailureMessage } from "@/lib/
 import {
   useSetDisabled,
   useSetPriority,
+  useSetConcurrency,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -197,6 +198,10 @@ export function CredentialCard({
   const [priorityValue, setPriorityValue] = useState(
     String(credential.priority),
   );
+  const [editingConcurrency, setEditingConcurrency] = useState(false);
+  const [concurrencyValue, setConcurrencyValue] = useState(
+    String(credential.maxConcurrency ?? 0),
+  );
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [showEditDialog, setShowEditDialog] = useState(false);
   const [showUpdateTokenDialog, setShowUpdateTokenDialog] = useState(false);
@@ -206,6 +211,7 @@ export function CredentialCard({
 
   const setDisabled = useSetDisabled();
   const setPriority = useSetPriority();
+  const setConcurrency = useSetConcurrency();
   const resetFailure = useResetFailure();
   const deleteCredential = useDeleteCredential();
   const forceRefresh = useForceRefreshToken();
@@ -238,6 +244,12 @@ export function CredentialCard({
   useEffect(() => {
     setThrottleRemaining(credential.throttledRemainingSecs ?? 0);
   }, [credential.throttledRemainingSecs]);
+  // 非编辑态时跟随后端最新上限（轮询刷新）
+  useEffect(() => {
+    if (!editingConcurrency) {
+      setConcurrencyValue(String(credential.maxConcurrency ?? 0));
+    }
+  }, [credential.maxConcurrency, editingConcurrency]);
   useEffect(() => {
     if (throttleRemaining <= 0) return;
     const t = window.setInterval(() => {
@@ -299,6 +311,24 @@ export function CredentialCard({
         onSuccess: (res) => {
           toast.success(res.message);
           setEditingPriority(false);
+        },
+        onError: (err) => toast.error("操作失败: " + (err as Error).message),
+      },
+    );
+  };
+
+  const handleConcurrencyChange = () => {
+    const nc = parseInt(concurrencyValue, 10);
+    if (isNaN(nc) || nc < 0) {
+      toast.error("并发上限必须是非负整数（0 = 不限制）");
+      return;
+    }
+    setConcurrency.mutate(
+      { id: credential.id, maxConcurrency: nc },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message);
+          setEditingConcurrency(false);
         },
         onError: (err) => toast.error("操作失败: " + (err as Error).message),
       },
@@ -532,6 +562,64 @@ export function CredentialCard({
                     title="点击编辑优先级"
                   >
                     {credential.priority}
+                    <Pencil className="h-3 w-3 opacity-70" />
+                  </button>
+                )}
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <dt className="shrink-0 text-muted-foreground">并发</dt>
+              <dd className="min-w-0">
+                {editingConcurrency ? (
+                  <div className="flex items-center gap-1">
+                    <Input
+                      type="number"
+                      value={concurrencyValue}
+                      onChange={(e) => setConcurrencyValue(e.target.value)}
+                      className="w-16 h-7 text-sm rounded-md"
+                      min="0"
+                      title="0 = 不限制"
+                    />
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="h-7 w-7"
+                      onClick={handleConcurrencyChange}
+                      disabled={setConcurrency.isPending}
+                    >
+                      ✓
+                    </Button>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="h-7 w-7"
+                      onClick={() => {
+                        setEditingConcurrency(false);
+                        setConcurrencyValue(String(credential.maxConcurrency ?? 0));
+                      }}
+                    >
+                      ✕
+                    </Button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
+                    onClick={() => setEditingConcurrency(true)}
+                    title="当前在途 / 上限（0 = 不限制 ∞）。点击设置上限"
+                  >
+                    <span className={credential.activeConcurrency > 0 ? "text-primary" : ""}>
+                      {credential.activeConcurrency}
+                    </span>
+                    <span className="text-muted-foreground/50">/</span>
+                    <span>
+                      {credential.maxConcurrency > 0 ? credential.maxConcurrency : "∞"}
+                    </span>
+                    {credential.waitingConcurrency > 0 && (
+                      <span className="text-amber-600 dark:text-amber-400">
+                        （等待 {credential.waitingConcurrency}）
+                      </span>
+                    )}
                     <Pencil className="h-3 w-3 opacity-70" />
                   </button>
                 )}

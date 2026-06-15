@@ -159,6 +159,9 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    // 必须在 Arc 化之后、对外服务之前填充 self_weak，否则 ConcurrencyGuard 退化为 no-op、
+    // 在途槽位永不释放（并发控制静默失效）。
+    token_manager.init_weak_self();
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),

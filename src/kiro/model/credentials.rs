@@ -140,6 +140,14 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+
+    /// 账号并发硬上限（0 = 不限制，默认值，兼容旧配置）
+    ///
+    /// `>0` 时，当该账号在途请求数 `active >= max_concurrency` 视为满载，选号时跳过。
+    /// 运行时态的 active/waiting 不持久化；此上限本身持久化，跟随凭据整个生命周期。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_zero")]
+    pub max_concurrency: u32,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -185,6 +193,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)
             .field("source_channel", &self.source_channel)
+            .field("max_concurrency", &self.max_concurrency)
             .finish()
     }
 }
@@ -491,6 +500,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            max_concurrency: 0,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -682,6 +692,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            max_concurrency: 0,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -717,6 +728,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            max_concurrency: 0,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -835,6 +847,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            max_concurrency: 0,
         };
 
         let json = original.to_pretty_json().unwrap();

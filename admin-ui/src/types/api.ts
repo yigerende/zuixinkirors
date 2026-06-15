@@ -83,6 +83,12 @@ export interface CredentialStatusItem {
   groups?: string[]
   /** 账号来源渠道（纯备注） */
   sourceChannel?: string
+  /** 并发硬上限（0 = 不限制） */
+  maxConcurrency: number
+  /** 当前在途请求数 */
+  activeConcurrency: number
+  /** 当前等待该凭据释放槽位的请求数 */
+  waitingConcurrency: number
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
@@ -166,6 +172,8 @@ export interface AddCredentialRequest {
   email?: string
   groups?: string[]
   sourceChannel?: string
+  /** 并发硬上限（0 = 不限制，默认 0） */
+  maxConcurrency?: number
 }
 
 // 添加凭据响应
@@ -186,6 +194,8 @@ export interface UpdateCredentialRequest {
   groups?: string[]
   /** 账号来源渠道（undefined 表示不修改，空串表示清除） */
   sourceChannel?: string
+  /** 并发硬上限（undefined 表示不修改；0 = 不限制，>0 = 上限） */
+  maxConcurrency?: number
 }
 
 // 更新 refreshToken 请求
