@@ -25,12 +25,16 @@ import {
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest } from '@/types/api'
 
+// 凭据列表默认自动刷新间隔（毫秒）。UI 未自定义时用此值。
+export const DEFAULT_CREDENTIALS_REFETCH_MS = 30000
+
 // 查询凭据列表
-export function useCredentials() {
+// refetchIntervalMs: 自动刷新间隔（毫秒），不传则用默认 30s。
+export function useCredentials(refetchIntervalMs?: number) {
   return useQuery({
     queryKey: ['credentials'],
     queryFn: getCredentials,
-    refetchInterval: 30000, // 每 30 秒刷新一次
+    refetchInterval: refetchIntervalMs ?? DEFAULT_CREDENTIALS_REFETCH_MS,
   })
 }
 

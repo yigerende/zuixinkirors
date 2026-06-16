@@ -170,6 +170,8 @@ pub(crate) struct RequestTracer {
     started_at: Instant,
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
+    /// 本次是否命中会话亲和（由 handler 在拿到 call_result 后写入）
+    session_affinity_hit: std::sync::atomic::AtomicBool,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
 }
 
@@ -209,6 +211,7 @@ impl RequestTracer {
             is_stream: options.is_stream,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
+            session_affinity_hit: std::sync::atomic::AtomicBool::new(false),
             attempts: parking_lot::Mutex::new(Vec::new()),
         }
     }
@@ -218,6 +221,14 @@ impl RequestTracer {
         let mut slot = self.first_token_at.lock();
         if slot.is_none() {
             *slot = Some(Instant::now());
+        }
+    }
+
+    /// 记录本次链路是否曾命中会话亲和。
+    pub fn set_session_affinity_hit(&self, hit: bool) {
+        if hit {
+            self.session_affinity_hit
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -262,6 +273,9 @@ impl RequestTracer {
             simulated_output_tokens: usage.simulated.map(|s| s.output_tokens),
             simulated_cache_creation_tokens: usage.simulated.map(|s| s.cache_creation_tokens),
             simulated_cache_read_tokens: usage.simulated.map(|s| s.cache_read_tokens),
+            session_affinity_hit: self
+                .session_affinity_hit
+                .load(std::sync::atomic::Ordering::Relaxed),
             attempts,
         };
         store.insert(&rec);
@@ -269,6 +283,10 @@ impl RequestTracer {
 }
 
 impl TraceSink for RequestTracer {
+    fn on_session_affinity_hit(&self, hit: bool) {
+        self.set_session_affinity_hit(hit);
+    }
+
     fn on_attempt(&self, attempt: TraceAttempt) {
         self.attempts.lock().push(attempt);
     }
@@ -701,7 +719,12 @@ pub async fn post_messages(
     // 计算会话粘性 key（必须在 conversation_state 被 move 进 kiro_request 之前）。
     let session_key = compute_session_key(
         &payload,
-        Some(conversion_result.conversation_state.conversation_id.as_str()),
+        Some(
+            conversion_result
+                .conversation_state
+                .conversation_id
+                .as_str(),
+        ),
     );
 
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
@@ -833,7 +856,12 @@ async fn handle_stream_request(
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref(), session_key.as_deref())
+        .call_api_stream(
+            request_body,
+            Some(tracer.as_ref()),
+            group.as_deref(),
+            session_key.as_deref(),
+        )
         .await
     {
         Ok(resp) => resp,
@@ -864,6 +892,7 @@ async fn handle_stream_request(
     ctx.cache_usage = cache_usage;
     ctx.cache_optimizer = Some(cache_optimizer);
     ctx.key_id = key_id;
+    tracer.set_session_affinity_hit(call_result.session_affinity_hit);
     if call_result.session_affinity_hit {
         tracing::debug!(credential_id, "命中会话亲和（流式）");
     }
@@ -1079,7 +1108,12 @@ async fn handle_non_stream_request(
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api(request_body, Some(tracer.as_ref()), group.as_deref(), session_key.as_deref())
+        .call_api(
+            request_body,
+            Some(tracer.as_ref()),
+            group.as_deref(),
+            session_key.as_deref(),
+        )
         .await
     {
         Ok(resp) => resp,
@@ -1097,6 +1131,7 @@ async fn handle_non_stream_request(
     };
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+    tracer.set_session_affinity_hit(call_result.session_affinity_hit);
     if call_result.session_affinity_hit {
         tracing::debug!(credential_id, "命中会话亲和（非流式）");
     }
@@ -1594,7 +1629,12 @@ pub async fn post_messages_cc(
     // 计算会话粘性 key（必须在 conversation_state 被 move 进 kiro_request 之前）。
     let session_key = compute_session_key(
         &payload,
-        Some(conversion_result.conversation_state.conversation_id.as_str()),
+        Some(
+            conversion_result
+                .conversation_state
+                .conversation_id
+                .as_str(),
+        ),
     );
 
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
@@ -1728,7 +1768,12 @@ async fn handle_stream_request_buffered(
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref(), session_key.as_deref())
+        .call_api_stream(
+            request_body,
+            Some(tracer.as_ref()),
+            group.as_deref(),
+            session_key.as_deref(),
+        )
         .await
     {
         Ok(resp) => resp,
@@ -1758,6 +1803,7 @@ async fn handle_stream_request_buffered(
     ctx.set_cache_usage(cache_usage);
     ctx.set_cache_optimizer(cache_optimizer);
     ctx.set_key_id(key_id);
+    tracer.set_session_affinity_hit(call_result.session_affinity_hit);
     if call_result.session_affinity_hit {
         tracing::debug!(credential_id, "命中会话亲和（缓冲流式）");
     }

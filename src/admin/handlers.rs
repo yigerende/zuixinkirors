@@ -19,11 +19,10 @@ use super::{
         BatchAddProxyRequest, ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
         CreateClientKeyRequest, CreateClientKeyResponse, GlobalProxyResponse,
         SetAccountThrottleConfigRequest, SetConcurrencyBatchRequest, SetConcurrencyRequest,
-        SetDisabledRequest, SetGlobalProxyRequest,
-        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
-        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
-        UpdateRefreshTokenRequest,
+        SetDisabledRequest, SetGlobalProxyRequest, SetLoadBalancingModeRequest,
+        SetLogGovernanceConfigRequest, SetPriorityRequest, SetUpdateConfigRequest,
+        StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest,
+        UpdateClientKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -124,7 +123,10 @@ pub async fn set_credential_concurrency(
     Path(id): Path<u64>,
     Json(payload): Json<SetConcurrencyRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_max_concurrency(id, payload.max_concurrency) {
+    match state
+        .service
+        .set_max_concurrency(id, payload.max_concurrency)
+    {
         Ok(_) => Json(SuccessResponse::new(format!(
             "凭据 #{} 并发上限已设置为 {}",
             id, payload.max_concurrency
@@ -1305,6 +1307,7 @@ pub async fn list_traces(
                 "simulatedOutputTokens": r.simulated_output_tokens,
                 "simulatedCacheCreationTokens": r.simulated_cache_creation_tokens,
                 "simulatedCacheReadTokens": r.simulated_cache_read_tokens,
+                "sessionAffinityHit": r.session_affinity_hit,
                 "credits": r.credits,
                 "firstTokenMs": r.first_token_ms,
                 "attempts": attempts,

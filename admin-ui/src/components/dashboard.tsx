@@ -82,6 +82,7 @@ import { ImageUpdateDialog } from "@/components/image-update-dialog";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
   useCredentials,
+  DEFAULT_CREDENTIALS_REFETCH_MS,
   useDeleteCredential,
   useResetFailure,
   useLoadBalancingMode,
@@ -189,7 +190,18 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   });
 
   const queryClient = useQueryClient();
-  const { data, isLoading, error, refetch } = useCredentials();
+  // 凭据列表自动刷新间隔（秒），持久化到 localStorage；空/非法时用默认 30s。
+  const [refreshSec, setRefreshSec] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      return localStorage.getItem("credRefreshSec") || "";
+    }
+    return "";
+  });
+  const refreshMs = (() => {
+    const n = parseInt(refreshSec, 10);
+    return !isNaN(n) && n >= 1 ? n * 1000 : DEFAULT_CREDENTIALS_REFETCH_MS;
+  })();
+  const { data, isLoading, error, refetch } = useCredentials(refreshMs);
   const { mutate: deleteCredential } = useDeleteCredential();
   const { mutate: resetFailure } = useResetFailure();
   const { mutateAsync: setConcurrencyBatch } = useSetConcurrencyBatch();
@@ -1310,6 +1322,27 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           </div>
 
           <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center sm:justify-end">
+            {/* 自动刷新间隔（秒）：空=默认 30s */}
+            <div className="col-span-2 flex items-center gap-1.5 sm:col-span-1" title="凭据列表（含并发状态）自动刷新间隔，留空使用默认 30 秒，最小 1 秒">
+              <RefreshCw className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <input
+                type="number"
+                min={1}
+                inputMode="numeric"
+                placeholder={`${DEFAULT_CREDENTIALS_REFETCH_MS / 1000}`}
+                value={refreshSec}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setRefreshSec(v);
+                  if (typeof window !== "undefined") {
+                    if (v.trim() === "") localStorage.removeItem("credRefreshSec");
+                    else localStorage.setItem("credRefreshSec", v);
+                  }
+                }}
+                className="h-8 w-16 rounded-md border border-input bg-background px-2 text-sm tabular-nums focus:outline-none focus:ring-1 focus:ring-ring"
+              />
+              <span className="shrink-0 text-xs text-muted-foreground">秒/刷新</span>
+            </div>
             {/* 选中态批量操作 */}
             {selectedIds.size > 0 && (
               <>

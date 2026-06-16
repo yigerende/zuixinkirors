@@ -567,6 +567,8 @@ export interface TraceRecord {
   simulatedOutputTokens?: number | null
   simulatedCacheCreationTokens?: number | null
   simulatedCacheReadTokens?: number | null
+  /** 本次是否命中会话亲和（balanced 模式复用了已绑定凭据） */
+  sessionAffinityHit?: boolean
   attempts: TraceAttempt[]
 }
 

@@ -447,19 +447,25 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
+            // 会话粘性只在首跳生效：首次 attempt 带 session_key（命中上游 prompt 缓存）；
+            // 失败后的重试传 None，改走 least-active 选号，避免瞬态 429 把整次请求的重试
+            // 全钉死在同一个被限流的凭据上（让重试有机会故障转移到空闲凭据）。
+            let attempt_session_key = if attempt == 0 { session_key } else { None };
             // 获取调用上下文 + 并发槽位守卫。slot_guard 是本次循环迭代的局部变量：
             // 成功时随 KiroCallResult 透传到 handler 持有到流读完；任何 continue
             // （429 退避 / 402 切号 / 网络错误）时作为局部变量自动 drop，释放旧凭据槽位。
             let (mut ctx, slot_guard) = match self
                 .token_manager
-                .acquire_context_for_session(model.as_deref(), group, session_key)
+                .acquire_context_for_session(model.as_deref(), group, attempt_session_key)
                 .await
             {
                 Ok(c) => c,
                 Err(e) => {
                     // 并发繁忙（所有可用凭据在途已满）：内部已等过 2s，重试只会叠加更多
                     // 等待且大概率仍满载，直接返回让 handler 映射 429。
-                    if e.to_string().contains(crate::kiro::token_manager::CONCURRENCY_BUSY_TAG) {
+                    if e.to_string()
+                        .contains(crate::kiro::token_manager::CONCURRENCY_BUSY_TAG)
+                    {
                         return Err(e);
                     }
                     Self::emit_attempt(
@@ -476,6 +482,9 @@ impl KiroProvider {
                     continue;
                 }
             };
+            if let Some(sink) = sink {
+                sink.on_session_affinity_hit(ctx.session_affinity_hit);
+            }
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
             self.ensure_profile_arn(&mut ctx).await;

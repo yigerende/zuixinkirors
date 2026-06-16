@@ -1259,7 +1259,12 @@ impl MultiTokenManager {
 
     /// 候选过滤：未禁用 + 未冷却 + 支持该模型（opus 订阅）+ 分组匹配。
     /// 这是 kiro.rs 版相对 junnl 的关键差异——叠加了 throttled 与 group 两道闸。
-    fn entry_is_available(entry: &CredentialEntry, is_opus: bool, group: Option<&str>, now: Instant) -> bool {
+    fn entry_is_available(
+        entry: &CredentialEntry,
+        is_opus: bool,
+        group: Option<&str>,
+        now: Instant,
+    ) -> bool {
         if entry.disabled {
             return false;
         }
@@ -1273,7 +1278,9 @@ impl MultiTokenManager {
     }
 
     fn model_is_opus(model: Option<&str>) -> bool {
-        model.map(|m| m.to_lowercase().contains("opus")).unwrap_or(false)
+        model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false)
     }
 
     fn is_full(entry: &CredentialEntry) -> bool {
@@ -1722,7 +1729,6 @@ impl MultiTokenManager {
             }
         }
     }
-
 
     /// 选择优先级最高的未禁用凭据作为当前凭据（内部方法）
     ///
@@ -4815,11 +4821,21 @@ mod tests {
         }
         // 不释放，5 个账号各应在途 1
         for id in 1..=5u64 {
-            assert_eq!(manager.active_count(id), 1, "账号 #{} 应均摊到 active=1", id);
+            assert_eq!(
+                manager.active_count(id),
+                1,
+                "账号 #{} 应均摊到 active=1",
+                id
+            );
         }
         drop(guards);
         for id in 1..=5u64 {
-            assert_eq!(manager.active_count(id), 0, "guard drop 后账号 #{} active 应归零", id);
+            assert_eq!(
+                manager.active_count(id),
+                0,
+                "guard drop 后账号 #{} active 应归零",
+                id
+            );
         }
     }
 
@@ -4843,7 +4859,8 @@ mod tests {
         hi.priority = 0;
         let mut lo = grouped_cred("lo", &[]);
         lo.priority = 1;
-        let manager = Arc::new(MultiTokenManager::new(config, vec![hi, lo], None, None, false).unwrap());
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![hi, lo], None, None, false).unwrap());
         manager.init_weak_self();
 
         let mut guards = Vec::new();
@@ -4891,7 +4908,8 @@ mod tests {
         hi.max_concurrency = 1;
         let mut lo = grouped_cred("lo", &[]);
         lo.priority = 1;
-        let manager = Arc::new(MultiTokenManager::new(config, vec![hi, lo], None, None, false).unwrap());
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![hi, lo], None, None, false).unwrap());
         manager.init_weak_self();
 
         let (ctx1, _g1) = manager.acquire_context(None, None).await.unwrap();
@@ -4940,6 +4958,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_retry_without_session_key_fails_over_to_least_active() {
+        // 模拟 provider 重试故障转移：
+        //   - 首跳 attempt0 带 session_key → 粘原号（即使它更忙），保 prompt 缓存；
+        //   - 重试 attempt>0 传 None → 不看粘性，走 least-active 选最闲号，实现故障转移。
+        let manager = concurrency_manager(2, "balanced");
+        let key = Some("sess-retry");
+
+        // 首次请求：把会话绑定到某号 A
+        let (ctx1, g1) = manager
+            .acquire_context_for_session(None, None, key)
+            .await
+            .unwrap();
+        let bound = ctx1.id;
+        drop(g1);
+
+        // 再用同 key 拿一个不释放：粘性命中 A，使 A.active=1（另一号 active=0）
+        let (ctx_hold, _hold) = manager
+            .acquire_context_for_session(None, None, key)
+            .await
+            .unwrap();
+        assert_eq!(ctx_hold.id, bound, "同 key 应粘到绑定号 A");
+        assert_eq!(manager.active_count(bound), 1, "A 此刻 active=1");
+
+        // attempt0 行为：带 key → 即使 A 更忙(active=1)也仍粘 A（保缓存优先）
+        let (ctx_sticky, g_s) = manager
+            .acquire_context_for_session(None, None, key)
+            .await
+            .unwrap();
+        assert_eq!(ctx_sticky.id, bound, "首跳带 session_key 应继续粘原号 A");
+        assert!(ctx_sticky.session_affinity_hit, "首跳应标记命中亲和");
+        drop(g_s);
+
+        // attempt>0 行为：传 None(等价 acquire_context) → least-active 选最闲号 ≠ A
+        let (ctx_failover, _g_f) = manager.acquire_context(None, None).await.unwrap();
+        assert_ne!(
+            ctx_failover.id, bound,
+            "重试(session_key=None)应绕过粘性、换到更闲的号实现故障转移"
+        );
+        assert!(
+            !ctx_failover.session_affinity_hit,
+            "重试换号不应标记命中亲和"
+        );
+    }
+
+    #[tokio::test]
     async fn test_token_refresh_failure_does_not_leak_active() {
         // 选号占槽后 token 刷新失败（无有效 token 且无法刷新）→ active 必须回到 0
         let mut config = Config::default();
@@ -4947,7 +5010,8 @@ mod tests {
         // 一个会刷新失败的 OAuth 凭据（无 access_token、无 refresh 能力）
         let mut bad = KiroCredentials::default();
         bad.refresh_token = Some("invalid".to_string());
-        let manager = Arc::new(MultiTokenManager::new(config, vec![bad], None, None, false).unwrap());
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![bad], None, None, false).unwrap());
         manager.init_weak_self();
 
         let _ = manager.acquire_context(None, None).await; // 预期失败
