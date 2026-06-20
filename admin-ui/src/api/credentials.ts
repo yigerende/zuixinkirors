@@ -341,6 +341,7 @@ export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promi
 export interface AccountThrottleConfig {
   failover: boolean
   cooldownSecs: number
+  maxTotalRetries: number
 }
 
 // 获取账号级风控故障转移配置

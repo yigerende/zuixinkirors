@@ -314,6 +314,13 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 单次请求的最大总重试次数（默认 9，范围 1..=20）。
+    ///
+    /// 实际重试预算 = min(分组账号数 × 每凭据重试次数, max_total_retries)。
+    /// 值越大故障转移机会越多，但 429 长退避下用户感知延迟也越高。
+    #[serde(default = "default_max_total_retries")]
+    pub max_total_retries: usize,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -400,6 +407,10 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_max_total_retries() -> usize {
+    9
+}
+
 fn default_update_auto_apply_time() -> String {
     "03:00".to_string()
 }
@@ -453,6 +464,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            max_total_retries: default_max_total_retries(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             trace_enabled: default_trace_enabled(),

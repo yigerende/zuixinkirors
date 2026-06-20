@@ -14,7 +14,7 @@ import {
 } from '@/components/ui/dialog'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent,
-  DropdownMenuItem, DropdownMenuLabel,
+  DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu'
 import {
   useLoadBalancingMode, useSetLoadBalancingMode,
@@ -118,6 +118,11 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       setThrottleConfig({ cooldownSecs: secs }, {
         onSuccess: () =>
           toast.success(`冷却时长已设为 ${Math.round(secs / 60)} 分钟`),
+        onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+      }),
+    updateMaxRetries: (n: number) =>
+      setThrottleConfig({ maxTotalRetries: n }, {
+        onSuccess: () => toast.success(`最大重试次数已设为 ${n}`),
         onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
       }),
   }
@@ -232,9 +237,10 @@ interface ToolControls {
   loadBalancingMode?: 'priority' | 'balanced'
   openImageUpdate: () => void
   openKeyDialog: () => void
-  throttleConfig?: { failover: boolean; cooldownSecs: number }
+  throttleConfig?: { failover: boolean; cooldownSecs: number; maxTotalRetries: number }
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateCooldown: (secs: number) => void
+  updateMaxRetries: (n: number) => void
 }
 
 function FullTools({ controls }: { controls: ToolControls }) {
@@ -247,6 +253,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         saving={controls.isSettingThrottle}
         onToggleFailover={controls.handleToggleFailover}
         onChangeCooldown={controls.updateCooldown}
+        onChangeMaxRetries={controls.updateMaxRetries}
       />
       <RefreshButton onRefresh={controls.handleRefresh} />
       <ImageUpdateButton controls={controls} />
@@ -262,6 +269,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
     saving: controls.isSettingThrottle,
     onToggleFailover: controls.handleToggleFailover,
     onChangeCooldown: controls.updateCooldown,
+    onChangeMaxRetries: controls.updateMaxRetries,
   }
 
   return (
@@ -377,17 +385,19 @@ function UpdateDot() {
 }
 
 interface ThrottleConfigButtonProps {
-  config?: { failover: boolean; cooldownSecs: number }
+  config?: { failover: boolean; cooldownSecs: number; maxTotalRetries: number }
   loading: boolean
   saving: boolean
   onToggleFailover: () => void
   onChangeCooldown: (secs: number) => void
+  onChangeMaxRetries: (n: number) => void
 }
 
 interface ThrottleState {
   cooldownMin: number
   cooldownSecs: number
   failover: boolean
+  maxTotalRetries: number
 }
 
 interface CustomCooldownFormProps {
@@ -425,14 +435,18 @@ const MAX_CUSTOM_COOLDOWN_MINUTES = 1440
  * - 5 个预设时长 + 一个自定义输入（分钟）
  */
 function ThrottleConfigButton({
-  config, loading, saving, onToggleFailover, onChangeCooldown,
+  config, loading, saving, onToggleFailover, onChangeCooldown, onChangeMaxRetries,
 }: ThrottleConfigButtonProps) {
   const [open, setOpen] = useState(false)
   const [customMin, setCustomMin] = useState('')
+  const [customRetries, setCustomRetries] = useState('')
   const state = readThrottleState(config)
 
   useEffect(() => {
-    if (!open) setCustomMin('')
+    if (!open) {
+      setCustomMin('')
+      setCustomRetries('')
+    }
   }, [open])
 
   const submitCustom = (e: React.FormEvent) => {
@@ -443,6 +457,17 @@ function ThrottleConfigButton({
       return
     }
     onChangeCooldown(min * SECONDS_PER_MINUTE)
+    setOpen(false)
+  }
+
+  const submitRetries = (e: React.FormEvent) => {
+    e.preventDefault()
+    const n = parseInt(customRetries, 10)
+    if (Number.isNaN(n) || n < 1 || n > 20) {
+      toast.error('请输入 1-20 之间的整数')
+      return
+    }
+    onChangeMaxRetries(n)
     setOpen(false)
   }
 
@@ -466,6 +491,25 @@ function ThrottleConfigButton({
           onDone={() => setOpen(false)}
           onSubmitCustom={submitCustom}
         />
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>最大重试次数（当前 {state.maxTotalRetries}）</DropdownMenuLabel>
+        <div className="px-2 pb-2">
+          <form onSubmit={submitRetries} className="flex items-center gap-1.5">
+            <Input
+              type="number"
+              min={1}
+              max={20}
+              placeholder={`1-20，当前 ${state.maxTotalRetries}`}
+              value={customRetries}
+              onChange={(e) => setCustomRetries(e.target.value)}
+              disabled={saving}
+              className="h-7 text-xs"
+            />
+            <Button type="submit" size="sm" variant="outline" disabled={saving || !customRetries} className="h-7 shrink-0 text-xs">
+              保存
+            </Button>
+          </form>
+        </div>
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -701,6 +745,7 @@ function readThrottleState(
     cooldownMin: secondsToMinutes(cooldownSecs),
     cooldownSecs,
     failover: config?.failover ?? true,
+    maxTotalRetries: config?.maxTotalRetries ?? 9,
   }
 }
 

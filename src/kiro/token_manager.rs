@@ -13,7 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -897,6 +897,8 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 单次请求最大总重试次数（运行时可修改）
+    max_total_retries: AtomicUsize,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -1137,6 +1139,7 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let max_total_retries = config.max_total_retries;
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1148,6 +1151,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            max_total_retries: AtomicUsize::new(max_total_retries),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             session_affinity: Mutex::new(HashMap::new()),
@@ -3632,6 +3636,11 @@ impl MultiTokenManager {
         self.account_throttle_cooldown_secs.load(Ordering::Relaxed)
     }
 
+    /// 获取最大总重试次数（Admin API）
+    pub fn get_max_total_retries(&self) -> usize {
+        self.max_total_retries.load(Ordering::Relaxed)
+    }
+
     /// 设置账号级风控故障转移配置（Admin API）
     ///
     /// 任一参数传 `None` 表示不修改该字段。
@@ -3639,6 +3648,7 @@ impl MultiTokenManager {
         &self,
         failover: Option<bool>,
         cooldown_secs: Option<u64>,
+        max_total_retries: Option<usize>,
     ) -> anyhow::Result<()> {
         if let Some(secs) = cooldown_secs {
             // 限定一个合理范围：1 秒到 24 小时
@@ -3646,13 +3656,20 @@ impl MultiTokenManager {
                 anyhow::bail!("冷却时长必须在 1..=86400 秒内: {}", secs);
             }
         }
+        if let Some(n) = max_total_retries {
+            if !(1..=20).contains(&n) {
+                anyhow::bail!("max_total_retries 必须在 1..=20: {}", n);
+            }
+        }
 
         let prev_failover = self.get_account_throttle_failover();
         let prev_cooldown = self.get_account_throttle_cooldown_secs();
+        let prev_retries = self.get_max_total_retries();
         let new_failover = failover.unwrap_or(prev_failover);
         let new_cooldown = cooldown_secs.unwrap_or(prev_cooldown);
+        let new_retries = max_total_retries.unwrap_or(prev_retries);
 
-        if new_failover == prev_failover && new_cooldown == prev_cooldown {
+        if new_failover == prev_failover && new_cooldown == prev_cooldown && new_retries == prev_retries {
             return Ok(());
         }
 
@@ -3660,20 +3677,25 @@ impl MultiTokenManager {
             .store(new_failover, Ordering::Relaxed);
         self.account_throttle_cooldown_secs
             .store(new_cooldown, Ordering::Relaxed);
+        self.max_total_retries
+            .store(new_retries, Ordering::Relaxed);
 
-        if let Err(err) = self.persist_account_throttle_config(new_failover, new_cooldown) {
+        if let Err(err) = self.persist_account_throttle_config(new_failover, new_cooldown, new_retries) {
             // 回滚内存值
             self.account_throttle_failover
                 .store(prev_failover, Ordering::Relaxed);
             self.account_throttle_cooldown_secs
                 .store(prev_cooldown, Ordering::Relaxed);
+            self.max_total_retries
+                .store(prev_retries, Ordering::Relaxed);
             return Err(err);
         }
 
         tracing::info!(
-            "账号级风控配置已更新: failover={}, cooldown_secs={}",
+            "账号级风控配置已更新: failover={}, cooldown_secs={}, max_total_retries={}",
             new_failover,
-            new_cooldown
+            new_cooldown,
+            new_retries,
         );
         Ok(())
     }
@@ -3682,6 +3704,7 @@ impl MultiTokenManager {
         &self,
         failover: bool,
         cooldown_secs: u64,
+        max_total_retries: usize,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
 
@@ -3697,6 +3720,7 @@ impl MultiTokenManager {
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
         config.account_throttle_failover = failover;
         config.account_throttle_cooldown_secs = cooldown_secs;
+        config.max_total_retries = max_total_retries;
         config
             .save()
             .with_context(|| format!("持久化账号级风控配置失败: {}", config_path.display()))?;
