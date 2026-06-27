@@ -443,6 +443,54 @@ fn resolve_usage_input_tokens(
     context_total_input_tokens.unwrap_or(fallback_total_input_tokens)
 }
 
+pub(crate) fn response_usage_for_downstream(
+    model: &str,
+    input_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
+    config: &CacheOptimizerConfig,
+    path: super::cache_rewriter::ResponsePath,
+    key_id: u64,
+) -> (i32, i32, i32) {
+    if cache_optimizer_controls_response(config, path, key_id) {
+        return (input_tokens, cache_creation_tokens, cache_read_tokens);
+    }
+
+    let input_tokens = if input_tokens == 0 { 1 } else { input_tokens };
+    let cache_read_tokens = if is_haiku_4_5_model(model) && cache_read_tokens == 0 {
+        1
+    } else {
+        cache_read_tokens
+    };
+    (input_tokens, cache_creation_tokens, cache_read_tokens)
+}
+
+pub(crate) fn is_haiku_4_5_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("haiku") && (model.contains("4-5") || model.contains("4.5"))
+}
+
+fn cache_optimizer_controls_response(
+    config: &CacheOptimizerConfig,
+    path: super::cache_rewriter::ResponsePath,
+    key_id: u64,
+) -> bool {
+    if !super::cache_rewriter::applies_to_client_key(config, key_id) {
+        return false;
+    }
+    if config.input_only_random_enabled && config.input_only_random_max > 0 {
+        return true;
+    }
+    if !config.enabled {
+        return false;
+    }
+    match path {
+        super::cache_rewriter::ResponsePath::Stream => config.enabled_stream,
+        super::cache_rewriter::ResponsePath::NonStream => config.enabled_non_stream,
+        super::cache_rewriter::ResponsePath::Buffered => config.enabled_buffered,
+    }
+}
+
 fn available_models() -> Vec<Model> {
     vec![
         Model {
@@ -1316,6 +1364,16 @@ async fn handle_non_stream_request(
         super::cache_rewriter::ResponsePath::NonStream,
         key_id,
     );
+    let (response_input_tokens, response_cache_creation_tokens, response_cache_read_tokens) =
+        response_usage_for_downstream(
+            model,
+            simulated_usage.input_tokens,
+            simulated_usage.cache_creation_tokens,
+            simulated_usage.cache_read_tokens,
+            &cache_optimizer.read(),
+            super::cache_rewriter::ResponsePath::NonStream,
+            key_id,
+        );
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1327,10 +1385,10 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
-            "input_tokens": simulated_usage.input_tokens,
+            "input_tokens": response_input_tokens,
             "output_tokens": simulated_usage.output_tokens,
-            "cache_creation_input_tokens": simulated_usage.cache_creation_tokens,
-            "cache_read_input_tokens": simulated_usage.cache_read_tokens
+            "cache_creation_input_tokens": response_cache_creation_tokens,
+            "cache_read_input_tokens": response_cache_read_tokens
         }
     });
 

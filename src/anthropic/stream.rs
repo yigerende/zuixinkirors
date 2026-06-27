@@ -1138,6 +1138,36 @@ impl StreamContext {
             simulated.cache_read_tokens,
         )
     }
+
+    /// Usage actually written to downstream SSE responses.
+    ///
+    /// Some downstream aggregators ignore `message_delta.usage.input_tokens == 0` and keep the
+    /// earlier `message_start` value. For the real, non-simulated path only, report a minimal
+    /// positive input in the final SSE event while keeping internal logs/trace on the true value.
+    fn response_usage(&self, path: super::cache_rewriter::ResponsePath) -> (i32, i32, i32) {
+        let (input, creation, read) = self.simulated_usage(path);
+        match &self.cache_optimizer {
+            Some(optimizer) => crate::anthropic::handlers::response_usage_for_downstream(
+                &self.model,
+                input,
+                creation,
+                read,
+                &optimizer.read(),
+                path,
+                self.key_id,
+            ),
+            None => {
+                let input = if input == 0 { 1 } else { input };
+                let read =
+                    if crate::anthropic::handlers::is_haiku_4_5_model(&self.model) && read == 0 {
+                        1
+                    } else {
+                        read
+                    };
+                (input, creation, read)
+            }
+        }
+    }
     /// 创建 StreamContext
     pub fn new_with_thinking(
         model: impl Into<String>,
@@ -2089,6 +2119,13 @@ impl StreamContext {
 
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+        self.generate_final_events_for_path(super::cache_rewriter::ResponsePath::Stream)
+    }
+
+    fn generate_final_events_for_path(
+        &mut self,
+        path: super::cache_rewriter::ResponsePath,
+    ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
         if self.is_thinking_block_open() && !self.in_thinking_block {
@@ -2179,8 +2216,7 @@ impl StreamContext {
         }
 
         // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
-        let (final_input_tokens, cache_creation, cache_read) =
-            self.simulated_usage(super::cache_rewriter::ResponsePath::Stream);
+        let (final_input_tokens, cache_creation, cache_read) = self.response_usage(path);
 
         // 生成最终事件
         events.extend(self.state_manager.generate_final_events(
@@ -2289,10 +2325,12 @@ impl BufferedStreamContext {
         // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
         let (final_input_tokens, cache_creation, cache_read) = self
             .inner
-            .simulated_usage(super::cache_rewriter::ResponsePath::Buffered);
+            .response_usage(super::cache_rewriter::ResponsePath::Buffered);
 
         // 生成最终事件（StreamContext 内部会用同样的优先级与分摊）
-        let final_events = self.inner.generate_final_events();
+        let final_events = self
+            .inner
+            .generate_final_events_for_path(super::cache_rewriter::ResponsePath::Buffered);
         self.event_buffer.extend(final_events);
 
         // 更正 message_start 事件中的 input_tokens 与 cache_* 字段
