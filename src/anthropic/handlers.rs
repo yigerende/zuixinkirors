@@ -444,7 +444,6 @@ fn resolve_usage_input_tokens(
 }
 
 pub(crate) fn response_usage_for_downstream(
-    model: &str,
     input_tokens: i32,
     cache_creation_tokens: i32,
     cache_read_tokens: i32,
@@ -457,17 +456,12 @@ pub(crate) fn response_usage_for_downstream(
     }
 
     let input_tokens = if input_tokens == 0 { 1 } else { input_tokens };
-    let cache_read_tokens = if is_haiku_4_5_model(model) && cache_read_tokens == 0 {
+    let cache_read_tokens = if cache_creation_tokens == 0 && cache_read_tokens == 0 {
         1
     } else {
         cache_read_tokens
     };
     (input_tokens, cache_creation_tokens, cache_read_tokens)
-}
-
-pub(crate) fn is_haiku_4_5_model(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    model.contains("haiku") && (model.contains("4-5") || model.contains("4.5"))
 }
 
 fn cache_optimizer_controls_response(
@@ -1366,7 +1360,6 @@ async fn handle_non_stream_request(
     );
     let (response_input_tokens, response_cache_creation_tokens, response_cache_read_tokens) =
         response_usage_for_downstream(
-            model,
             simulated_usage.input_tokens,
             simulated_usage.cache_creation_tokens,
             simulated_usage.cache_read_tokens,

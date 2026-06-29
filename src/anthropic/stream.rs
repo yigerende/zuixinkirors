@@ -1148,7 +1148,6 @@ impl StreamContext {
         let (input, creation, read) = self.simulated_usage(path);
         match &self.cache_optimizer {
             Some(optimizer) => crate::anthropic::handlers::response_usage_for_downstream(
-                &self.model,
                 input,
                 creation,
                 read,
@@ -1158,12 +1157,7 @@ impl StreamContext {
             ),
             None => {
                 let input = if input == 0 { 1 } else { input };
-                let read =
-                    if crate::anthropic::handlers::is_haiku_4_5_model(&self.model) && read == 0 {
-                        1
-                    } else {
-                        read
-                    };
+                let read = if creation == 0 && read == 0 { 1 } else { read };
                 (input, creation, read)
             }
         }
