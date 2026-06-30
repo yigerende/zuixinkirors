@@ -105,10 +105,21 @@ export interface CacheMeteringStatsCounters {
   inflightTimeout: number
 }
 
+export interface CacheMeteringUsage {
+  window: 'ttl'
+  windowSeconds: number
+  calls: number
+  inputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  cacheHitRate: number
+}
+
 export interface CacheMeteringResponse {
   config: CacheMeteringConfig
   runtime: CacheMeteringRuntime | null
   stats: CacheMeteringStatsCounters | null
+  usage?: CacheMeteringUsage | null
 }
 
 export interface CredentialsStatusResponse {

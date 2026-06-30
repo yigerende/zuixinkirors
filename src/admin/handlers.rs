@@ -57,7 +57,9 @@ pub async fn set_cache_optimizer(
 
 /// GET /api/admin/cache-metering
 pub async fn get_cache_metering(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.get_cache_metering())
+    let mut response = state.service.get_cache_metering();
+    attach_cache_metering_usage(&state, &mut response);
+    Json(response)
 }
 
 /// PUT /api/admin/cache-metering
@@ -66,14 +68,56 @@ pub async fn set_cache_metering(
     Json(payload): Json<CacheMeteringConfig>,
 ) -> impl IntoResponse {
     match state.service.set_cache_metering(payload) {
-        Ok(response) => Json(response).into_response(),
+        Ok(mut response) => {
+            attach_cache_metering_usage(&state, &mut response);
+            Json(response).into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
 
 /// GET /api/admin/cache-metering/stats
 pub async fn get_cache_metering_stats(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.get_cache_metering())
+    let mut response = state.service.get_cache_metering();
+    attach_cache_metering_usage(&state, &mut response);
+    Json(response)
+}
+
+fn attach_cache_metering_usage(state: &AdminState, response: &mut serde_json::Value) {
+    let ttl_seconds = response
+        .get("config")
+        .and_then(|config| config.get("defaultTtlSeconds"))
+        .and_then(|value| value.as_i64())
+        .unwrap_or(300)
+        .clamp(60, 3600);
+    let since_epoch = chrono::Utc::now().timestamp().saturating_sub(ttl_seconds);
+    let stats = state.trace_store.token_stats_since(since_epoch);
+    let input_tokens = stats.input_tokens;
+    let cache_creation_tokens = stats.cache_creation_tokens;
+    let cache_read_tokens = stats.cache_read_tokens;
+    let calls = stats.calls;
+
+    let denom = input_tokens.saturating_add(cache_read_tokens);
+    let cache_hit_rate = if denom == 0 {
+        0.0
+    } else {
+        (cache_read_tokens as f64 / denom as f64) * 100.0
+    };
+
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert(
+            "usage".to_string(),
+            serde_json::json!({
+                "window": "ttl",
+                "windowSeconds": ttl_seconds,
+                "calls": calls,
+                "inputTokens": input_tokens,
+                "cacheCreationTokens": cache_creation_tokens,
+                "cacheReadTokens": cache_read_tokens,
+                "cacheHitRate": cache_hit_rate,
+            }),
+        );
+    }
 }
 
 /// POST /api/admin/cache-metering/clear

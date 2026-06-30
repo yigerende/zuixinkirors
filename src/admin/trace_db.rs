@@ -213,6 +213,15 @@ pub struct TraceStore {
     retention_days: AtomicU64,
 }
 
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenWindowStats {
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+}
+
 impl TraceStore {
     /// 打开（或创建）数据库并建表。空路径归一为当前目录下的 traces.db。
     pub fn open(path: PathBuf, enabled: bool, retention_days: u32) -> rusqlite::Result<Self> {
@@ -411,6 +420,37 @@ impl TraceStore {
             Err(e) => {
                 tracing::warn!("trace 查询失败: {}", e);
                 (Vec::new(), 0)
+            }
+        }
+    }
+
+    pub fn token_stats_since(&self, since_epoch: i64) -> TokenWindowStats {
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT COUNT(*), \
+             COALESCE(SUM(input_tokens), 0), \
+             COALESCE(SUM(cache_creation_tokens), 0), \
+             COALESCE(SUM(cache_read_tokens), 0) \
+             FROM traces WHERE ts_epoch >= ?1",
+        ) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                tracing::warn!("trace token_stats_since prepare 失败: {}", e);
+                return TokenWindowStats::default();
+            }
+        };
+        match stmt.query_row([since_epoch], |row| {
+            Ok(TokenWindowStats {
+                calls: row.get::<_, i64>(0)? as u64,
+                input_tokens: row.get::<_, i64>(1)? as u64,
+                cache_creation_tokens: row.get::<_, i64>(2)? as u64,
+                cache_read_tokens: row.get::<_, i64>(3)? as u64,
+            })
+        }) {
+            Ok(stats) => stats,
+            Err(e) => {
+                tracing::warn!("trace token_stats_since 查询失败: {}", e);
+                TokenWindowStats::default()
             }
         }
     }

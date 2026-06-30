@@ -45,6 +45,7 @@ pub struct CacheEntry {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct CacheMeteringCounters {
     pub session_parse_ok: u64,
     pub session_parse_failed: u64,

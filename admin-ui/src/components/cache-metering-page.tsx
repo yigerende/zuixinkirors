@@ -56,11 +56,10 @@ export function CacheMeteringPage() {
   }, [data])
 
   const hitRate = useMemo(() => {
-    const stats = data?.stats
-    if (!stats) return 0
-    const total = stats.lookupHit + stats.lookupMiss
-    return total > 0 ? (stats.lookupHit / total) * 100 : 0
-  }, [data?.stats])
+    const usage = data?.usage
+    if (!usage) return 0
+    return usage.cacheHitRate
+  }, [data?.usage])
 
   const saveConfig = () => {
     save(form, {
@@ -168,6 +167,9 @@ export function CacheMeteringPage() {
             <CardTitle>运行统计</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
+            <p className="text-xs text-muted-foreground">
+              运行统计为本进程启动后累计；条目和会话可能来自落盘恢复。
+            </p>
             <StatsGrid stats={data?.stats ?? null} />
             <div className="flex flex-wrap gap-2 pt-2">
               <Button variant="outline" onClick={handleClearExpired} disabled={isClearingExpired}>
