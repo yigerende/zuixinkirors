@@ -1124,6 +1124,7 @@ impl StreamContext {
             return (input, creation, read);
         };
         let simulated = super::cache_rewriter::rewrite_usage_for_response(
+            &self.model,
             input,
             self.output_tokens,
             creation,
@@ -1148,6 +1149,7 @@ impl StreamContext {
         let (input, creation, read) = self.simulated_usage(path);
         match &self.cache_optimizer {
             Some(optimizer) => crate::anthropic::handlers::response_usage_for_downstream(
+                &self.model,
                 input,
                 creation,
                 read,

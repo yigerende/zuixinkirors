@@ -86,6 +86,8 @@ pub struct CacheOptimizerConfig {
     #[serde(default)]
     pub probe_bypass_input_token_values: Vec<u64>,
     #[serde(default)]
+    pub excluded_model_names: Vec<String>,
+    #[serde(default)]
     pub probe_bypass_stream: bool,
     #[serde(default)]
     pub probe_bypass_non_stream: bool,
@@ -192,6 +194,7 @@ impl Default for CacheOptimizerConfig {
             input_only_random_max: 0,
             probe_bypass_max_input_tokens: None,
             probe_bypass_input_token_values: Vec::new(),
+            excluded_model_names: Vec::new(),
             probe_bypass_stream: false,
             probe_bypass_non_stream: false,
             probe_bypass_buffered: false,

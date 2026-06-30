@@ -37,6 +37,7 @@ export interface CacheOptimizerConfig {
   inputOnlyRandomMax: number
   probeBypassMaxInputTokens: number | null
   probeBypassInputTokenValues: number[]
+  excludedModelNames: string[]
   probeBypassStream: boolean
   probeBypassNonStream: boolean
   probeBypassBuffered: boolean

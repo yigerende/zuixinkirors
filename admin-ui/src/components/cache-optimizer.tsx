@@ -40,6 +40,7 @@ const DEFAULT_CONFIG: CacheOptimizerConfig = {
   inputOnlyRandomMax: 0,
   probeBypassMaxInputTokens: null,
   probeBypassInputTokenValues: [],
+  excludedModelNames: [],
   probeBypassStream: false,
   probeBypassNonStream: false,
   probeBypassBuffered: false,
@@ -102,6 +103,7 @@ export function CacheOptimizer() {
   const { mutate: save, isPending: isSaving } = useSetCacheOptimizer()
   const [form, setForm] = useState<CacheOptimizerConfig>(DEFAULT_CONFIG)
   const [probeBypassExactInput, setProbeBypassExactInput] = useState('')
+  const [excludedModelInput, setExcludedModelInput] = useState('')
 
   useEffect(() => {
     // 合并默认值兜底：老配置可能缺少新增字段（探活豁免/输入放大）
@@ -141,6 +143,29 @@ export function CacheOptimizer() {
     setForm(prev => ({
       ...prev,
       probeBypassInputTokenValues: prev.probeBypassInputTokenValues.filter(item => item !== value),
+    }))
+  }
+
+  const addExcludedModelName = () => {
+    const value = excludedModelInput.trim()
+    if (!value) {
+      toast.error('请输入模型名称')
+      return
+    }
+    setForm(prev => {
+      if (prev.excludedModelNames.includes(value)) return prev
+      return {
+        ...prev,
+        excludedModelNames: [...prev.excludedModelNames, value].sort((a, b) => a.localeCompare(b)),
+      }
+    })
+    setExcludedModelInput('')
+  }
+
+  const removeExcludedModelName = (value: string) => {
+    setForm(prev => ({
+      ...prev,
+      excludedModelNames: prev.excludedModelNames.filter(item => item !== value),
     }))
   }
 
@@ -667,6 +692,48 @@ export function CacheOptimizer() {
                 {label}
               </label>
             ))}
+          </div>
+          <div className="space-y-2 border-t border-border/60 pt-3">
+            <p className="text-xs text-muted-foreground">
+              模型豁免：填入下游看到的完整模型名称，匹配到时该请求完全不走模拟缓存，按真实缓存逻辑返回。
+            </p>
+            <div className="flex items-center gap-3 flex-wrap">
+              <span className="text-sm font-medium">排除模型</span>
+              <input
+                type="text"
+                placeholder="claude-haiku-4-5-20251001"
+                value={excludedModelInput}
+                onChange={e => setExcludedModelInput(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    addExcludedModelName()
+                  }
+                }}
+                className="h-9 min-w-[280px] rounded-md border border-input bg-background px-3 text-sm"
+              />
+              <Button type="button" variant="outline" size="sm" onClick={addExcludedModelName}>
+                添加
+              </Button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {form.excludedModelNames.length === 0 ? (
+                <span className="text-xs text-muted-foreground">未配置模型豁免</span>
+              ) : (
+                form.excludedModelNames.map(value => (
+                  <button
+                    type="button"
+                    key={value}
+                    onClick={() => removeExcludedModelName(value)}
+                    className="inline-flex items-center gap-1 rounded-md border border-input bg-background px-2 py-1 text-xs font-mono hover:bg-muted"
+                    title="点击删除"
+                  >
+                    {value}
+                    <span className="text-muted-foreground">x</span>
+                  </button>
+                ))
+              )}
+            </div>
           </div>
         </CardContent>
       </Card>

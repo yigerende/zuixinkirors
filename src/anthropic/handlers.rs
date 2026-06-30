@@ -444,6 +444,7 @@ fn resolve_usage_input_tokens(
 }
 
 pub(crate) fn response_usage_for_downstream(
+    model: &str,
     input_tokens: i32,
     cache_creation_tokens: i32,
     cache_read_tokens: i32,
@@ -451,7 +452,7 @@ pub(crate) fn response_usage_for_downstream(
     path: super::cache_rewriter::ResponsePath,
     key_id: u64,
 ) -> (i32, i32, i32) {
-    if cache_optimizer_controls_response(config, path, key_id) {
+    if cache_optimizer_controls_response(config, path, key_id, model) {
         return (input_tokens, cache_creation_tokens, cache_read_tokens);
     }
 
@@ -468,8 +469,12 @@ fn cache_optimizer_controls_response(
     config: &CacheOptimizerConfig,
     path: super::cache_rewriter::ResponsePath,
     key_id: u64,
+    model: &str,
 ) -> bool {
     if !super::cache_rewriter::applies_to_client_key(config, key_id) {
+        return false;
+    }
+    if super::cache_rewriter::is_model_excluded(config, model) {
         return false;
     }
     if config.input_only_random_enabled && config.input_only_random_max > 0 {
@@ -1350,6 +1355,7 @@ async fn handle_non_stream_request(
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
         cache_usage.split_against_total(total_input_tokens);
     let simulated_usage = super::cache_rewriter::rewrite_usage_for_response(
+        model,
         final_input_tokens,
         output_tokens,
         cache_creation_tokens,
@@ -1360,6 +1366,7 @@ async fn handle_non_stream_request(
     );
     let (response_input_tokens, response_cache_creation_tokens, response_cache_read_tokens) =
         response_usage_for_downstream(
+            model,
             simulated_usage.input_tokens,
             simulated_usage.cache_creation_tokens,
             simulated_usage.cache_read_tokens,

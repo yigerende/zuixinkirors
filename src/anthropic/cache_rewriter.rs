@@ -19,6 +19,7 @@ pub(crate) struct SimulatedUsage {
 ///
 /// 这里不回写 CacheMeter、不影响 token_manager、不改变 provider 调用与内部真实统计。
 pub(crate) fn rewrite_usage_for_response(
+    model: &str,
     input_tokens: i32,
     output_tokens: i32,
     cache_creation_tokens: i32,
@@ -28,6 +29,15 @@ pub(crate) fn rewrite_usage_for_response(
     key_id: u64,
 ) -> SimulatedUsage {
     if !applies_to_client_key(config, key_id) {
+        return SimulatedUsage {
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        };
+    }
+
+    if is_model_excluded(config, model) {
         return SimulatedUsage {
             input_tokens,
             output_tokens,
@@ -88,6 +98,15 @@ pub(crate) fn rewrite_usage_for_response(
 
 pub(crate) fn applies_to_client_key(config: &CacheOptimizerConfig, key_id: u64) -> bool {
     config.client_key_ids.is_empty() || config.client_key_ids.contains(&key_id)
+}
+
+pub(crate) fn is_model_excluded(config: &CacheOptimizerConfig, model: &str) -> bool {
+    let model = model.trim();
+    !model.is_empty()
+        && config
+            .excluded_model_names
+            .iter()
+            .any(|name| name.trim() == model)
 }
 
 fn path_enabled(config: &CacheOptimizerConfig, path: ResponsePath) -> bool {
@@ -515,8 +534,16 @@ mod tests {
         config.probe_bypass_non_stream = true;
         config.input_random_max = 10;
 
-        let usage =
-            rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::NonStream, 0);
+        let usage = rewrite_usage_for_response(
+            "claude-test",
+            100,
+            20,
+            300,
+            400,
+            &config,
+            ResponsePath::NonStream,
+            0,
+        );
 
         assert_eq!(
             usage,
@@ -541,7 +568,16 @@ mod tests {
             write_multiplier: 9.0,
         }];
 
-        let usage = rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 0);
+        let usage = rewrite_usage_for_response(
+            "claude-test",
+            100,
+            20,
+            300,
+            400,
+            &config,
+            ResponsePath::Stream,
+            0,
+        );
 
         assert_eq!(
             usage,
@@ -567,7 +603,16 @@ mod tests {
             write_multiplier: 9.0,
         }];
 
-        let usage = rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 0);
+        let usage = rewrite_usage_for_response(
+            "claude-test",
+            100,
+            20,
+            300,
+            400,
+            &config,
+            ResponsePath::Stream,
+            0,
+        );
 
         assert_eq!(
             usage,
@@ -593,7 +638,16 @@ mod tests {
             write_multiplier: 3.0,
         }];
 
-        let usage = rewrite_usage_for_response(100, 20, 500, 800, &config, ResponsePath::Stream, 0);
+        let usage = rewrite_usage_for_response(
+            "claude-test",
+            100,
+            20,
+            500,
+            800,
+            &config,
+            ResponsePath::Stream,
+            0,
+        );
 
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 20);
@@ -607,8 +661,16 @@ mod tests {
         config.input_random_max = 5;
 
         for _ in 0..100 {
-            let usage =
-                rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Buffered, 0);
+            let usage = rewrite_usage_for_response(
+                "claude-test",
+                100,
+                20,
+                300,
+                400,
+                &config,
+                ResponsePath::Buffered,
+                0,
+            );
 
             assert!(
                 (1..=5).contains(&usage.input_tokens),
@@ -638,8 +700,16 @@ mod tests {
         }];
 
         for _ in 0..100 {
-            let usage =
-                rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 0);
+            let usage = rewrite_usage_for_response(
+                "claude-test",
+                100,
+                20,
+                300,
+                400,
+                &config,
+                ResponsePath::Stream,
+                0,
+            );
 
             assert!(
                 (1..=7).contains(&usage.input_tokens),
@@ -670,8 +740,16 @@ mod tests {
         }];
 
         for _ in 0..100 {
-            let usage =
-                rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 0);
+            let usage = rewrite_usage_for_response(
+                "claude-test",
+                100,
+                20,
+                300,
+                400,
+                &config,
+                ResponsePath::Stream,
+                0,
+            );
 
             assert!(
                 (1..=9).contains(&usage.input_tokens),
@@ -688,14 +766,30 @@ mod tests {
     fn client_key_scope_empty_means_all_keys_and_non_matching_key_is_passthrough() {
         let mut config = make_config("zero", true);
 
-        let all_keys_usage =
-            rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 11);
+        let all_keys_usage = rewrite_usage_for_response(
+            "claude-test",
+            100,
+            20,
+            300,
+            400,
+            &config,
+            ResponsePath::Stream,
+            11,
+        );
         assert_eq!(all_keys_usage.cache_creation_tokens, 0);
         assert_eq!(all_keys_usage.cache_read_tokens, 0);
 
         config.client_key_ids = vec![7, 9];
-        let blocked_usage =
-            rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 11);
+        let blocked_usage = rewrite_usage_for_response(
+            "claude-test",
+            100,
+            20,
+            300,
+            400,
+            &config,
+            ResponsePath::Stream,
+            11,
+        );
         assert_eq!(
             blocked_usage,
             SimulatedUsage {
@@ -706,10 +800,48 @@ mod tests {
             }
         );
 
-        let matching_usage =
-            rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 9);
+        let matching_usage = rewrite_usage_for_response(
+            "claude-test",
+            100,
+            20,
+            300,
+            400,
+            &config,
+            ResponsePath::Stream,
+            9,
+        );
         assert_eq!(matching_usage.cache_creation_tokens, 0);
         assert_eq!(matching_usage.cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn excluded_model_names_bypass_all_simulation_rules() {
+        let mut config = make_config("zero", true);
+        config.input_random_max = 99;
+        config.input_only_random_enabled = true;
+        config.input_only_random_max = 9;
+        config.excluded_model_names = vec!["claude-haiku-4-5-20251001".to_string()];
+
+        let usage = rewrite_usage_for_response(
+            "claude-haiku-4-5-20251001",
+            0,
+            20,
+            0,
+            0,
+            &config,
+            ResponsePath::Stream,
+            0,
+        );
+
+        assert_eq!(
+            usage,
+            SimulatedUsage {
+                input_tokens: 0,
+                output_tokens: 20,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            }
+        );
     }
 
     fn screenshot_config() -> CacheOptimizerConfig {
@@ -770,6 +902,7 @@ mod tests {
             keep_raw_breakdown: true,
             probe_bypass_max_input_tokens: Some(1_000),
             probe_bypass_input_token_values: Vec::new(),
+            excluded_model_names: Vec::new(),
             probe_bypass_stream: true,
             probe_bypass_non_stream: true,
             probe_bypass_buffered: false,
@@ -808,7 +941,16 @@ mod tests {
     #[test]
     fn screenshot_config_probe_bypass_keeps_small_requests_original() {
         let config = screenshot_config();
-        let usage = rewrite_usage_for_response(100, 20, 300, 400, &config, ResponsePath::Stream, 0);
+        let usage = rewrite_usage_for_response(
+            "claude-test",
+            100,
+            20,
+            300,
+            400,
+            &config,
+            ResponsePath::Stream,
+            0,
+        );
         assert_eq!(
             usage,
             SimulatedUsage {
@@ -823,8 +965,16 @@ mod tests {
     #[test]
     fn screenshot_config_buffered_path_is_disabled() {
         let config = screenshot_config();
-        let usage =
-            rewrite_usage_for_response(10_000, 20, 300, 400, &config, ResponsePath::Buffered, 0);
+        let usage = rewrite_usage_for_response(
+            "claude-test",
+            10_000,
+            20,
+            300,
+            400,
+            &config,
+            ResponsePath::Buffered,
+            0,
+        );
         assert_eq!(
             usage,
             SimulatedUsage {
@@ -841,6 +991,7 @@ mod tests {
         let config = screenshot_config();
         for _ in 0..1000 {
             let usage = rewrite_usage_for_response(
+                "claude-test",
                 200_000,
                 20,
                 480_000,
