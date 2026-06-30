@@ -4,7 +4,7 @@ import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, Gauge } from "lucide-react";
+import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, Gauge, DatabaseZap } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -48,8 +48,13 @@ const CacheOptimizer = lazy(() =>
     default: m.CacheOptimizer,
   })),
 );
+const CacheMeteringPage = lazy(() =>
+  import("@/components/cache-metering-page").then((m) => ({
+    default: m.CacheMeteringPage,
+  })),
+);
 
-type Tab = "overview" | "credentials" | "keys" | "groups" | "cache" | "traces";
+type Tab = "overview" | "credentials" | "keys" | "groups" | "cacheMetering" | "cache" | "traces";
 
 const TABS: {
   key: Tab;
@@ -82,6 +87,12 @@ const TABS: {
     icon: <FolderTree className="h-3.5 w-3.5" />,
   },
   {
+    key: "cacheMetering",
+    label: "真实缓存",
+    mobileLabel: "真实",
+    icon: <DatabaseZap className="h-3.5 w-3.5" />,
+  },
+  {
     key: "cache",
     label: "模拟缓存",
     mobileLabel: "缓存",
@@ -101,11 +112,13 @@ function readTabFromHash(): Tab {
     h === "credentials" ||
     h === "keys" ||
     h === "groups" ||
+    h === "cacheMetering" ||
+    h === "cache-metering" ||
     h === "cache" ||
     h === "overview" ||
     h === "traces"
   )
-    return h;
+    return h === "cache-metering" ? "cacheMetering" : h;
   return "overview";
 }
 
@@ -389,6 +402,7 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
         {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}
         {tab === "keys" && <ClientKeysPage />}
         {tab === "groups" && <GroupsPage />}
+        {tab === "cacheMetering" && <CacheMeteringPage />}
         {tab === "cache" && <CacheOptimizer />}
         {tab === "traces" && <TraceLogPage />}
       </Suspense>

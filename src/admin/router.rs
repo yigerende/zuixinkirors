@@ -12,14 +12,16 @@ use super::{
         check_rate_limit, check_update, clear_throttle, complete_social_login,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
+        clear_cache_metering, clear_cache_metering_expired, clear_cache_metering_session,
         export_credentials, force_refresh_token, get_account_throttle_config, get_all_credentials,
-        get_cache_optimizer, get_credential_balance, get_credential_models, get_global_proxy,
+        get_cache_metering, get_cache_metering_stats, get_cache_optimizer, get_credential_balance,
+        get_credential_models, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool,
         get_update_config,
         list_client_keys, list_groups, list_traces, poll_idc_login, poll_idc_relogin,
         poll_social_login, poll_social_relogin, pull_update_image, reset_all_success_count,
         reset_client_key_stats, reset_failure_count, reset_success_count, rollback_image_update,
-        rotate_client_key, set_account_throttle_config, set_cache_optimizer,
+        rotate_client_key, set_account_throttle_config, set_cache_metering, set_cache_optimizer,
         set_client_key_disabled, set_credential_concurrency, set_credential_concurrency_batch,
         set_credential_disabled, set_credential_overage,
         set_credential_priority, set_global_proxy, set_load_balancing_mode,
@@ -113,6 +115,20 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/cache-optimizer",
             get(get_cache_optimizer).put(set_cache_optimizer),
+        )
+        .route(
+            "/cache-metering",
+            get(get_cache_metering).put(set_cache_metering),
+        )
+        .route("/cache-metering/stats", get(get_cache_metering_stats))
+        .route("/cache-metering/clear", post(clear_cache_metering))
+        .route(
+            "/cache-metering/clear-expired",
+            post(clear_cache_metering_expired),
+        )
+        .route(
+            "/cache-metering/clear-session",
+            post(clear_cache_metering_session),
         )
         .route(
             "/config/global-proxy",

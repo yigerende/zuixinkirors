@@ -14,7 +14,7 @@ use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
-use crate::model::config::{CacheOptimizerConfig, Config};
+use crate::model::config::{CacheMeteringConfig, CacheOptimizerConfig, Config};
 
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
@@ -119,6 +119,8 @@ pub struct AdminService {
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
     /// 模拟缓存配置热更新句柄。
     cache_optimizer_live: Option<Arc<parking_lot::RwLock<CacheOptimizerConfig>>>,
+    /// 真实缓存计量器句柄。
+    cache_meter_live: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
 }
 
 /// Social 登录会话状态
@@ -192,6 +194,37 @@ fn parse_auto_apply_time(value: &str) -> Result<(u32, u32), AdminServiceError> {
 fn normalize_auto_apply_time(value: &str) -> Result<String, AdminServiceError> {
     let (h, m) = parse_auto_apply_time(value)?;
     Ok(format!("{:02}:{:02}", h, m))
+}
+
+fn validate_cache_metering_config(
+    config: &CacheMeteringConfig,
+) -> Result<(), AdminServiceError> {
+    if config.max_entries == 0 {
+        return Err(AdminServiceError::InvalidCredential(
+            "maxEntries 必须大于 0".to_string(),
+        ));
+    }
+    if !(60..=3600).contains(&config.default_ttl_seconds) {
+        return Err(AdminServiceError::InvalidCredential(
+            "defaultTtlSeconds 必须在 60 到 3600 之间".to_string(),
+        ));
+    }
+    if config.max_session_entries == 0 {
+        return Err(AdminServiceError::InvalidCredential(
+            "maxSessionEntries 必须大于 0".to_string(),
+        ));
+    }
+    if config.singleflight.wait_ms > 200 {
+        return Err(AdminServiceError::InvalidCredential(
+            "singleflight.waitMs 建议不超过 200".to_string(),
+        ));
+    }
+    if !(0.0..=1.0).contains(&config.debug.sample_rate) {
+        return Err(AdminServiceError::InvalidCredential(
+            "debug.sampleRate 必须在 0 到 1 之间".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// GitHub `repos/{owner}/{repo}/releases/tags/{tag}` 返回 JSON 中我们关心
@@ -429,6 +462,7 @@ impl AdminService {
             trace_store: None,
             usage_recorder: None,
             cache_optimizer_live: None,
+            cache_meter_live: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -473,6 +507,14 @@ impl AdminService {
         self
     }
 
+    pub fn with_cache_meter(
+        mut self,
+        cache_meter: crate::anthropic::cache_metering::SharedCacheMeter,
+    ) -> Self {
+        self.cache_meter_live = Some(cache_meter);
+        self
+    }
+
     pub fn get_cache_optimizer(&self) -> CacheOptimizerConfig {
         if let Some(live) = &self.cache_optimizer_live {
             live.read().clone()
@@ -511,6 +553,70 @@ impl AdminService {
         }
 
         Ok(new_config)
+    }
+
+    pub fn get_cache_metering(&self) -> serde_json::Value {
+        let config = self
+            .cache_meter_live
+            .as_ref()
+            .map(|meter| meter.config_handle().read().clone())
+            .unwrap_or_else(|| self.token_manager.config().cache_metering.clone());
+        let stats = self.cache_meter_live.as_ref().map(|meter| meter.stats());
+        serde_json::json!({
+            "config": config,
+            "runtime": stats.as_ref().map(|s| &s.runtime),
+            "stats": stats.as_ref().map(|s| &s.counters),
+        })
+    }
+
+    pub fn set_cache_metering(
+        &self,
+        new_config: CacheMeteringConfig,
+    ) -> Result<serde_json::Value, AdminServiceError> {
+        validate_cache_metering_config(&new_config)?;
+
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| AdminServiceError::InternalError("配置文件路径未知".to_string()))?;
+
+        let mut config = Config::load(&config_path)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        config.cache_metering = new_config.clone();
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        if let Some(meter) = &self.cache_meter_live {
+            *meter.config_handle().write() = new_config;
+        }
+
+        Ok(self.get_cache_metering())
+    }
+
+    pub fn clear_cache_metering_all(&self) -> Result<usize, AdminServiceError> {
+        let meter = self.cache_meter_live.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("真实缓存计量器未启用".to_string())
+        })?;
+        let before = meter.stats().runtime.entries_total;
+        meter.clear_all();
+        Ok(before)
+    }
+
+    pub fn clear_cache_metering_expired(&self) -> Result<usize, AdminServiceError> {
+        let meter = self.cache_meter_live.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("真实缓存计量器未启用".to_string())
+        })?;
+        Ok(meter.clear_expired())
+    }
+
+    pub fn clear_cache_metering_session(&self, session: &str) -> Result<usize, AdminServiceError> {
+        let meter = self.cache_meter_live.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("真实缓存计量器未启用".to_string())
+        })?;
+        Ok(meter.clear_session(session))
     }
 
     /// 获取所有凭据状态

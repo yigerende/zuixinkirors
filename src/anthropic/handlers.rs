@@ -823,8 +823,11 @@ pub async fn post_messages(
     let cache_usage = state
         .cache_meter
         .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
+        .map(|cache| super::cache_metering::compute_cache_usage_async(cache, &payload, key_ctx.key_id));
+    let cache_usage = match cache_usage {
+        Some(fut) => fut.await,
+        None => Default::default(),
+    };
 
     if payload.stream {
         // 流式响应
@@ -1743,8 +1746,11 @@ pub async fn post_messages_cc(
     let cache_usage = state
         .cache_meter
         .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
+        .map(|cache| super::cache_metering::compute_cache_usage_async(cache, &payload, key_ctx.key_id));
+    let cache_usage = match cache_usage {
+        Some(fut) => fut.await,
+        None => Default::default(),
+    };
 
     if payload.stream {
         // 流式响应（缓冲模式）

@@ -260,9 +260,12 @@ async fn main() {
 
     // CacheMeter：模拟 Anthropic 缓存、计量 cache_read/creation token 的进程内组件。
     // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
-    let cache_meter = std::sync::Arc::new(anthropic::cache_metering::CacheMeter::new(Some(
-        cache_dir.join("cache_metering.json"),
-    )));
+    let cache_metering_config =
+        std::sync::Arc::new(parking_lot::RwLock::new(config.cache_metering.clone()));
+    let cache_meter = std::sync::Arc::new(anthropic::cache_metering::CacheMeter::with_config(
+        Some(cache_dir.join("cache_metering.json")),
+        cache_metering_config.clone(),
+    ));
     cache_meter.clone().spawn_background();
 
     // 模拟缓存配置仅用于最终下游响应字段改写；内部上游调用与真实统计逻辑不读取它。
@@ -299,7 +302,8 @@ async fn main() {
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),
                     )
-                    .with_cache_optimizer(cache_optimizer.clone());
+                    .with_cache_optimizer(cache_optimizer.clone())
+                    .with_cache_meter(cache_meter.clone());
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,

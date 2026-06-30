@@ -20,16 +20,15 @@
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-/// 默认条目上限（防止内存无限增长）
-const DEFAULT_CAPACITY: usize = 4096;
 /// 最长 TTL（1h，与 Anthropic ttl="1h" 对齐）
 const MAX_TTL_SECS: i64 = 3600;
-/// 默认 TTL（5min，ephemeral 默认值）
-const DEFAULT_TTL_SECS: i64 = 5 * 60;
+
+use crate::model::config::{CacheMeteringConfig, CacheMeteringSessionConfig};
 
 /// 单个缓存条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +39,67 @@ pub struct CacheEntry {
     pub expires_at: i64,
     /// 上次命中时间（用于 LRU 淘汰）
     pub last_hit_at: i64,
+    /// 该段所属会话隔离 seed，用于按 session 限制和清理。
+    #[serde(default)]
+    pub session_seed: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct CacheMeteringCounters {
+    pub session_parse_ok: u64,
+    pub session_parse_failed: u64,
+    pub seed_metadata_json: u64,
+    pub seed_metadata_legacy: u64,
+    pub seed_key_id: u64,
+    pub lookup_hit: u64,
+    pub lookup_miss: u64,
+    pub evicted_lru: u64,
+    pub evicted_expired: u64,
+    pub evicted_session_limit: u64,
+    pub inflight_wait: u64,
+    pub inflight_hit_after_wait: u64,
+    pub inflight_timeout: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheMeteringRuntime {
+    pub entries_total: usize,
+    pub sessions_total: usize,
+    pub inflight_total: usize,
+    pub persist_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheMeteringStats {
+    pub runtime: CacheMeteringRuntime,
+    pub counters: CacheMeteringCounters,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedSource {
+    MetadataJson,
+    MetadataLegacy,
+    KeyId,
+    Disabled,
+}
+
+#[derive(Debug, Clone)]
+pub struct IsolationSeed {
+    pub seed: String,
+    pub source: SeedSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InflightState {
+    Writer,
+    Waiter,
+}
+
+#[derive(Debug, Clone)]
+struct InflightEntry {
+    expires_at: i64,
 }
 
 /// 一次查询的结果（每段一份）
@@ -109,40 +169,117 @@ impl CacheUsage {
 pub struct CacheMeter {
     inner: Mutex<Inner>,
     persist_path: Option<PathBuf>,
+    config: Arc<parking_lot::RwLock<CacheMeteringConfig>>,
 }
 
 #[derive(Default)]
 struct Inner {
     entries: HashMap<u64, CacheEntry>,
+    session_index: HashMap<String, HashSet<u64>>,
+    inflight: HashMap<u64, InflightEntry>,
+    counters: CacheMeteringCounters,
     /// 自上次落盘后是否有变化
     dirty: bool,
 }
 
 impl CacheMeter {
     /// 创建一个空 cache。`persist_path` 为 `Some` 时会自动从该文件加载历史。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(persist_path: Option<PathBuf>) -> Self {
+        Self::with_config(
+            persist_path,
+            Arc::new(parking_lot::RwLock::new(CacheMeteringConfig::default())),
+        )
+    }
+
+    pub fn with_config(
+        persist_path: Option<PathBuf>,
+        config: Arc<parking_lot::RwLock<CacheMeteringConfig>>,
+    ) -> Self {
         let mut inner = Inner::default();
-        if let Some(path) = persist_path.as_ref() {
-            if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(entries) = serde_json::from_slice::<HashMap<u64, CacheEntry>>(&bytes) {
-                    let now = now_secs();
-                    for (k, v) in entries {
-                        if v.expires_at > now {
-                            inner.entries.insert(k, v);
+        let persist_enabled = config.read().persist_enabled;
+        if persist_enabled {
+            if let Some(path) = persist_path.as_ref() {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(entries) =
+                        serde_json::from_slice::<HashMap<u64, CacheEntry>>(&bytes)
+                    {
+                        let now = now_secs();
+                        for (k, mut v) in entries {
+                            if v.expires_at > now {
+                                if v.session_seed.is_empty() {
+                                    v.session_seed = "legacy".to_string();
+                                }
+                                inner
+                                    .session_index
+                                    .entry(v.session_seed.clone())
+                                    .or_default()
+                                    .insert(k);
+                                inner.entries.insert(k, v);
+                            }
                         }
+                        tracing::info!(
+                            "CacheMeter 重建：从 {} 加载 {} 条有效记录",
+                            path.display(),
+                            inner.entries.len()
+                        );
                     }
-                    tracing::info!(
-                        "CacheMeter 重建：从 {} 加载 {} 条有效记录",
-                        path.display(),
-                        inner.entries.len()
-                    );
                 }
             }
         }
         Self {
             inner: Mutex::new(inner),
             persist_path,
+            config,
         }
+    }
+
+    pub fn config_handle(&self) -> Arc<parking_lot::RwLock<CacheMeteringConfig>> {
+        self.config.clone()
+    }
+
+    pub fn stats(&self) -> CacheMeteringStats {
+        let inner = self.inner.lock();
+        CacheMeteringStats {
+            runtime: CacheMeteringRuntime {
+                entries_total: inner.entries.len(),
+                sessions_total: inner.session_index.len(),
+                inflight_total: inner.inflight.len(),
+                persist_path: self.persist_path.as_ref().map(|p| p.display().to_string()),
+            },
+            counters: inner.counters,
+        }
+    }
+
+    pub fn clear_all(&self) {
+        let mut inner = self.inner.lock();
+        inner.entries.clear();
+        inner.session_index.clear();
+        inner.inflight.clear();
+        inner.dirty = true;
+    }
+
+    pub fn clear_expired(&self) -> usize {
+        self.evict_expired()
+    }
+
+    pub fn clear_session(&self, session_seed_or_fp: &str) -> usize {
+        let mut inner = self.inner.lock();
+        let target = inner
+            .session_index
+            .keys()
+            .find(|seed| seed.as_str() == session_seed_or_fp || session_fingerprint(seed) == session_seed_or_fp)
+            .cloned();
+        let Some(seed) = target else { return 0 };
+        let hashes = inner.session_index.remove(&seed).unwrap_or_default();
+        let removed = hashes.len();
+        for hash in hashes {
+            inner.entries.remove(&hash);
+        }
+        if removed > 0 {
+            inner.dirty = true;
+        }
+        removed
     }
 
     /// 查询一组前缀段哈希，返回每段命中情况；命中段会刷新 last_hit_at。
@@ -154,6 +291,7 @@ impl CacheMeter {
         let now = now_secs();
         let mut inner = self.inner.lock();
         let mut out = Vec::with_capacity(segment_hashes.len());
+        let mut hit_any = false;
         for (h, t) in segment_hashes.iter().zip(segment_tokens.iter()) {
             let hit = match inner.entries.get_mut(h) {
                 Some(entry) if entry.expires_at > now => {
@@ -162,41 +300,123 @@ impl CacheMeter {
                 }
                 _ => false,
             };
+            hit_any |= hit;
             out.push(SegmentResult { hit, tokens: *t });
+        }
+        if hit_any {
+            inner.counters.lookup_hit = inner.counters.lookup_hit.saturating_add(1);
+        } else {
+            inner.counters.lookup_miss = inner.counters.lookup_miss.saturating_add(1);
         }
         out
     }
 
     /// 把一组前缀段写入缓存（用于 miss 后登记 / 续期）。`ttl_secs` clip 到 [60, MAX_TTL_SECS]。
-    pub fn record(&self, segment_hashes: &[u64], segment_tokens: &[u32], ttl_secs: i64) {
+    pub fn record(
+        &self,
+        session_seed: &str,
+        segment_hashes: &[u64],
+        segment_tokens: &[u32],
+        ttl_secs: i64,
+    ) {
         debug_assert_eq!(segment_hashes.len(), segment_tokens.len());
         let ttl = ttl_secs.clamp(60, MAX_TTL_SECS);
         let now = now_secs();
         let expires_at = now + ttl;
+        let config = self.config.read().clone();
         let mut inner = self.inner.lock();
         for (h, t) in segment_hashes.iter().zip(segment_tokens.iter()) {
+            let old_session_seed = inner.entries.get(h).map(|old| old.session_seed.clone());
+            if old_session_seed.as_deref().is_some_and(|old| old != session_seed) {
+                if let Some(old) = old_session_seed.as_deref() {
+                    remove_from_session_index(&mut inner.session_index, old, *h);
+                }
+            }
             inner.entries.insert(
                 *h,
                 CacheEntry {
                     tokens: *t,
                     expires_at,
                     last_hit_at: now,
+                    session_seed: session_seed.to_string(),
                 },
             );
+            inner
+                .session_index
+                .entry(session_seed.to_string())
+                .or_default()
+                .insert(*h);
         }
         inner.dirty = true;
-        // 容量超限：按 last_hit_at 淘汰最旧的若干条
-        if inner.entries.len() > DEFAULT_CAPACITY {
-            let drop_n = inner.entries.len() - DEFAULT_CAPACITY;
+        enforce_session_limit(&mut inner, session_seed, config.max_session_entries);
+        enforce_global_capacity(&mut inner, &config);
+    }
+
+    fn begin_inflight(&self, hash: u64) -> InflightState {
+        let config = self.config.read().clone();
+        if !config.singleflight.enabled || config.singleflight.wait_ms == 0 {
+            return InflightState::Writer;
+        }
+        let now = now_secs();
+        let mut inner = self.inner.lock();
+        cleanup_inflight(&mut inner, now);
+        if inner.inflight.contains_key(&hash) {
+            inner.counters.inflight_wait = inner.counters.inflight_wait.saturating_add(1);
+            return InflightState::Waiter;
+        }
+        if inner.inflight.len() >= config.singleflight.max_inflight {
             let mut victims: Vec<(u64, i64)> = inner
-                .entries
+                .inflight
                 .iter()
-                .map(|(k, v)| (*k, v.last_hit_at))
+                .map(|(k, v)| (*k, v.expires_at))
                 .collect();
             victims.sort_by_key(|x| x.1);
+            let drop_n = inner.inflight.len() + 1 - config.singleflight.max_inflight;
             for (k, _) in victims.into_iter().take(drop_n) {
-                inner.entries.remove(&k);
+                inner.inflight.remove(&k);
             }
+        }
+        inner.inflight.insert(
+            hash,
+            InflightEntry {
+                expires_at: now + config.singleflight.inflight_ttl_seconds.max(1),
+            },
+        );
+        InflightState::Writer
+    }
+
+    fn finish_inflight(&self, hash: u64) {
+        self.inner.lock().inflight.remove(&hash);
+    }
+
+    fn mark_inflight_hit_after_wait(&self) {
+        let mut inner = self.inner.lock();
+        inner.counters.inflight_hit_after_wait =
+            inner.counters.inflight_hit_after_wait.saturating_add(1);
+    }
+
+    fn mark_inflight_timeout(&self) {
+        let mut inner = self.inner.lock();
+        inner.counters.inflight_timeout = inner.counters.inflight_timeout.saturating_add(1);
+    }
+
+    fn observe_seed_source(&self, source: SeedSource) {
+        let mut inner = self.inner.lock();
+        match source {
+            SeedSource::MetadataJson => {
+                inner.counters.session_parse_ok = inner.counters.session_parse_ok.saturating_add(1);
+                inner.counters.seed_metadata_json = inner.counters.seed_metadata_json.saturating_add(1);
+            }
+            SeedSource::MetadataLegacy => {
+                inner.counters.session_parse_ok = inner.counters.session_parse_ok.saturating_add(1);
+                inner.counters.seed_metadata_legacy = inner.counters.seed_metadata_legacy.saturating_add(1);
+            }
+            SeedSource::KeyId => {
+                inner.counters.session_parse_failed =
+                    inner.counters.session_parse_failed.saturating_add(1);
+                inner.counters.seed_key_id = inner.counters.seed_key_id.saturating_add(1);
+            }
+            SeedSource::Disabled => {}
         }
     }
 
@@ -206,6 +426,9 @@ impl CacheMeter {
             Some(p) => p,
             None => return,
         };
+        if !self.config.read().persist_enabled {
+            return;
+        }
         let snapshot = {
             let mut inner = self.inner.lock();
             if !inner.dirty {
@@ -233,9 +456,19 @@ impl CacheMeter {
     pub fn spawn_background(self: Arc<Self>) {
         let weak = Arc::downgrade(&self);
         tokio::spawn(async move {
-            let interval = std::time::Duration::from_secs(60);
             loop {
-                tokio::time::sleep(interval).await;
+                let interval = weak
+                    .upgrade()
+                    .map(|cache| {
+                        cache
+                            .config
+                            .read()
+                            .cleanup_interval_seconds
+                            .min(cache.config.read().persist_interval_seconds)
+                            .max(1)
+                    })
+                    .unwrap_or(60);
+                tokio::time::sleep(Duration::from_secs(interval)).await;
                 let Some(cache) = weak.upgrade() else { return };
                 cache.evict_expired();
                 cache.flush_to_disk();
@@ -245,14 +478,25 @@ impl CacheMeter {
 
     /// 删除已过期条目（lookup 不命中过期时只是返回 miss，不会顺手清理；
     /// 这里在后台周期里清一次，避免内存膨胀）。
-    pub fn evict_expired(&self) {
+    pub fn evict_expired(&self) -> usize {
         let now = now_secs();
         let mut inner = self.inner.lock();
-        let before = inner.entries.len();
-        inner.entries.retain(|_, v| v.expires_at > now);
-        if inner.entries.len() != before {
+        let expired: Vec<u64> = inner
+            .entries
+            .iter()
+            .filter_map(|(hash, entry)| (entry.expires_at <= now).then_some(*hash))
+            .collect();
+        let removed = expired.len();
+        for hash in expired {
+            remove_entry(&mut inner, hash);
+        }
+        cleanup_inflight(&mut inner, now);
+        if removed > 0 {
+            inner.counters.evicted_expired =
+                inner.counters.evicted_expired.saturating_add(removed as u64);
             inner.dirty = true;
         }
+        removed
     }
 
     #[cfg(test)]
@@ -270,12 +514,17 @@ fn now_secs() -> i64 {
 }
 
 /// 解析 cache_control 的 ttl 字符串（"5m" / "1h"）→ 秒
-pub fn parse_ttl(ttl: Option<&str>) -> i64 {
+fn parse_ttl_with_default(ttl: Option<&str>, default_ttl_secs: i64) -> i64 {
     match ttl {
         Some(s) if s.eq_ignore_ascii_case("1h") => 3600,
         Some(s) if s.eq_ignore_ascii_case("5m") => 300,
-        _ => DEFAULT_TTL_SECS,
+        _ => default_ttl_secs,
     }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn parse_ttl(ttl: Option<&str>) -> i64 {
+    parse_ttl_with_default(ttl, 5 * 60)
 }
 
 /// `Arc<CacheMeter>` 别名
@@ -319,8 +568,17 @@ struct Segment {
 /// `key_id` 是客户端 Key id，用于会话隔离：前缀哈希会混入一个隔离种子（优先取
 /// 请求 metadata 里的 session，否则退回 key_id），使不同会话 / 不同客户端 Key 的
 /// 缓存互不命中——同一前缀只在同一会话内复用。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u64) -> CacheUsage {
-    let (segments, prompt_total_est) = extract_segments(req, key_id);
+    if !cache.config.read().enabled {
+        return CacheUsage {
+            prompt_total_est: estimate_request_tokens(req) as i32,
+            ..Default::default()
+        };
+    }
+
+    let (segments, prompt_total_est, seed) = extract_segments(req, key_id, &cache.config.read());
+    cache.observe_seed_source(seed.source);
     if segments.is_empty() {
         // 无断点：仍带出 prompt_total_est 以便调用方将来扩展，但 covered=0 → 全入 input。
         return CacheUsage {
@@ -331,7 +589,7 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
 
     let hashes: Vec<u64> = segments.iter().map(|s| s.hash).collect();
     let cum_tokens: Vec<u32> = segments.iter().map(|s| s.cumulative_tokens).collect();
-    let results = cache.lookup(&hashes, &cum_tokens);
+    let mut results = cache.lookup(&hashes, &cum_tokens);
 
     // 诊断（DEBUG 级）：打印每段 hash / 累计 token / 命中情况，排查跨轮 miss。
     if tracing::enabled!(tracing::Level::DEBUG) {
@@ -354,7 +612,24 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
         );
     }
 
-    let deepest_hit = results.iter().rposition(|r| r.hit);
+    let mut deepest_hit = results.iter().rposition(|r| r.hit);
+    let deepest_hash = hashes.last().copied().unwrap_or_default();
+    let inflight_state = if deepest_hit.is_none() {
+        cache.begin_inflight(deepest_hash)
+    } else {
+        InflightState::Writer
+    };
+    if inflight_state == InflightState::Waiter {
+        // 这里保持同步零阻塞：handler 当前是同步调用真实缓存计量，避免 sleep 卡住
+        // Tokio worker。已有 writer 极快写入时，二次 lookup 仍可消除一部分重复写。
+        results = cache.lookup(&hashes, &cum_tokens);
+        deepest_hit = results.iter().rposition(|r| r.hit);
+        if deepest_hit.is_some() {
+            cache.mark_inflight_hit_after_wait();
+        } else {
+            cache.mark_inflight_timeout();
+        }
+    }
     // 被缓存覆盖的前缀 = 最深断点累计（最深断点之后的尾部是未缓存的真 input）。
     // 命中时 read = 命中段累计、creation = covered − read；全 miss 时 read = 0。
     let covered = *cum_tokens.last().unwrap();
@@ -365,7 +640,92 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
 
     // 把所有段一次性写回（命中段刷新 last_hit_at；未命中段插入）。所有段共用同一
     // ttl（detect_max_ttl 的单值），单次加锁 + 单次容量检查，避免逐段重复开销。
-    cache.record(&hashes, &cum_tokens, segments[0].ttl_secs);
+    cache.record(&seed.seed, &hashes, &cum_tokens, segments[0].ttl_secs);
+    if inflight_state == InflightState::Writer {
+        cache.finish_inflight(deepest_hash);
+    }
+
+    CacheUsage {
+        cache_read: cache_read as i32,
+        cache_covered_est: covered as i32,
+        prompt_total_est: prompt_total_est as i32,
+    }
+}
+
+pub async fn compute_cache_usage_async(
+    cache: &CacheMeter,
+    req: &MessagesRequest,
+    key_id: u64,
+) -> CacheUsage {
+    if !cache.config.read().enabled {
+        return CacheUsage {
+            prompt_total_est: estimate_request_tokens(req) as i32,
+            ..Default::default()
+        };
+    }
+
+    let (segments, prompt_total_est, seed) = extract_segments(req, key_id, &cache.config.read());
+    cache.observe_seed_source(seed.source);
+    if segments.is_empty() {
+        return CacheUsage {
+            prompt_total_est: prompt_total_est as i32,
+            ..Default::default()
+        };
+    }
+
+    let hashes: Vec<u64> = segments.iter().map(|s| s.hash).collect();
+    let cum_tokens: Vec<u32> = segments.iter().map(|s| s.cumulative_tokens).collect();
+    let mut results = cache.lookup(&hashes, &cum_tokens);
+
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let dump: Vec<String> = segments
+            .iter()
+            .zip(results.iter())
+            .enumerate()
+            .map(|(i, (s, r))| {
+                format!(
+                    "[{i}] hash={} cum={} hit={}",
+                    s.hash, s.cumulative_tokens, r.hit
+                )
+            })
+            .collect();
+        tracing::debug!(
+            "CacheMeter: {} 段, msgs={} | {}",
+            segments.len(),
+            req.messages.len(),
+            dump.join(", ")
+        );
+    }
+
+    let mut deepest_hit = results.iter().rposition(|r| r.hit);
+    let deepest_hash = hashes.last().copied().unwrap_or_default();
+    let inflight_state = if deepest_hit.is_none() {
+        cache.begin_inflight(deepest_hash)
+    } else {
+        InflightState::Writer
+    };
+    if inflight_state == InflightState::Waiter {
+        let wait_ms = cache.config.read().singleflight.wait_ms;
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        results = cache.lookup(&hashes, &cum_tokens);
+        deepest_hit = results.iter().rposition(|r| r.hit);
+        if deepest_hit.is_some() {
+            cache.mark_inflight_hit_after_wait();
+        } else {
+            cache.mark_inflight_timeout();
+        }
+    }
+
+    let covered = *cum_tokens.last().unwrap();
+    let cache_read = match deepest_hit {
+        Some(i) => cum_tokens[i],
+        None => 0u32,
+    };
+
+    cache.record(&seed.seed, &hashes, &cum_tokens, segments[0].ttl_secs);
+    if inflight_state == InflightState::Writer {
+        cache.finish_inflight(deepest_hash);
+    }
 
     CacheUsage {
         cache_read: cache_read as i32,
@@ -385,7 +745,11 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
 ///
 /// `key_id` 用于会话隔离：哈希以一个隔离种子起头（优先用 metadata session，否则
 /// key_id），种子不计入 token，只让不同会话的同前缀产生不同 hash → 互不命中。
-fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
+fn extract_segments(
+    req: &MessagesRequest,
+    key_id: u64,
+    config: &CacheMeteringConfig,
+) -> (Vec<Segment>, u32, IsolationSeed) {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     let mut cum_tokens: u32 = 0;
@@ -393,7 +757,8 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
 
     // 会话隔离种子：作为哈希链最前置的输入，不进 token 估算。同一会话内前缀稳定
     // 复用；跨会话 / 跨客户端 Key 的相同前缀因种子不同而 hash 不同，互不命中。
-    hasher.update(isolation_seed(req, key_id).as_bytes());
+    let seed = isolation_seed(req, key_id, &config.session);
+    hasher.update(seed.seed.as_bytes());
 
     // feed 解耦哈希与 token 估算：`hash_text` 进哈希链（决定命中），`token_text`
     // 进 token 累计（决定数值口径）。两者分离是为了让 token 计数贴近**原文**，
@@ -435,7 +800,7 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
     // 导致 cache_read 恒为 0、全部记成 creation。
 
     // 统一 ttl：探测整个请求里出现过的最大 cache_control.ttl，否则默认 5m。
-    let ttl = detect_max_ttl(req);
+    let ttl = detect_max_ttl(req, config.default_ttl_seconds);
 
     // 1. tools（全部喂入，作为前缀基础的一部分；工具定义跨轮稳定）。
     if let Some(tools) = req.tools.as_ref() {
@@ -523,7 +888,7 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
         }
     }
 
-    (segments, cum_tokens)
+    (segments, cum_tokens, seed)
 }
 
 /// 生成会话隔离种子，作为前缀哈希链的最前置输入。
@@ -534,39 +899,103 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
 ///   2. 退回客户端 Key id —— 至少保证不同客户端 Key 之间隔离。
 ///
 /// 种子只参与哈希、不计入 token 估算，因此不影响 cache_creation/read 的数值口径。
-fn isolation_seed(req: &MessagesRequest, key_id: u64) -> String {
-    if let Some(session) = req
+fn isolation_seed(
+    req: &MessagesRequest,
+    key_id: u64,
+    config: &CacheMeteringSessionConfig,
+) -> IsolationSeed {
+    if let Some((session, source)) = req
         .metadata
         .as_ref()
         .and_then(|m| m.user_id.as_deref())
-        .and_then(extract_session_id)
+        .and_then(|user_id| extract_session_id_with_config(user_id, config))
     {
-        return format!("sess:{session}");
+        return IsolationSeed {
+            seed: format!("sess:{session}"),
+            source,
+        };
     }
-    format!("key:{key_id}")
+    if config.fallback_to_key_id {
+        IsolationSeed {
+            seed: format!("key:{key_id}"),
+            source: SeedSource::KeyId,
+        }
+    } else {
+        IsolationSeed {
+            seed: "disabled".to_string(),
+            source: SeedSource::Disabled,
+        }
+    }
 }
 
 /// 从 Claude Code 的 user_id 中提取 session 标识。
 ///
-/// 格式形如 `user_<hash>_account__session_<uuid>`，取 `_session_` 之后的部分。
-/// 不含该标记时返回 None（交由调用方退回 key_id）。
+/// 支持 JSON `{"session_id":"..."}` 和老格式 `..._session_<uuid>`。
+/// 不含可用 session 时返回 None（交由调用方退回 key_id）。
 ///
 /// `pub(crate)`：会话粘性调度（token_manager / handlers）复用同一套提取逻辑，
 /// 保证缓存隔离种子与粘性 session key 同源。
 pub(crate) fn extract_session_id(user_id: &str) -> Option<String> {
-    user_id
-        .split_once("_session_")
-        .map(|(_, sid)| sid.trim().to_string())
-        .filter(|s| !s.is_empty())
+    extract_session_id_with_config(user_id, &CacheMeteringSessionConfig::default())
+        .map(|(session, _)| session)
+}
+
+pub(crate) fn extract_session_id_with_config(
+    user_id: &str,
+    config: &CacheMeteringSessionConfig,
+) -> Option<(String, SeedSource)> {
+    if config.enable_json_metadata {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
+            if let Some(session_id) = json.get("session_id").and_then(|v| v.as_str()) {
+                if let Some(clean) = clean_session_id(session_id, config.strict_uuid) {
+                    return Some((clean, SeedSource::MetadataJson));
+                }
+            }
+        }
+    }
+
+    if config.enable_legacy_metadata {
+        if let Some((_, tail)) = user_id.split_once("_session_") {
+            if let Some(clean) = clean_session_id(tail, config.strict_uuid) {
+                return Some((clean, SeedSource::MetadataLegacy));
+            }
+        }
+        if let Some(tail) = user_id.strip_prefix("session_") {
+            if let Some(clean) = clean_session_id(tail, config.strict_uuid) {
+                return Some((clean, SeedSource::MetadataLegacy));
+            }
+        }
+    }
+
+    None
+}
+
+fn clean_session_id(raw: &str, strict_uuid: bool) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !strict_uuid {
+        return Some(trimmed.to_string());
+    }
+    let candidate = trimmed.get(..36)?;
+    is_valid_uuid(candidate).then(|| candidate.to_string())
+}
+
+fn is_valid_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.chars().filter(|c| *c == '-').count() == 4
+        && s.chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 /// 探测请求里出现过的最大 cache_control.ttl（"1h" 优先于 "5m"）；
 /// 无任何 cache_control 时返回默认 5m。决定写入缓存段的存活时长。
-fn detect_max_ttl(req: &MessagesRequest) -> i64 {
-    let mut ttl = DEFAULT_TTL_SECS;
+fn detect_max_ttl(req: &MessagesRequest, default_ttl_secs: i64) -> i64 {
+    let mut ttl = default_ttl_secs.clamp(60, MAX_TTL_SECS);
     let mut bump = |cc: Option<&CacheControl>| {
         if let Some(cc) = cc {
-            ttl = ttl.max(parse_ttl(cc.ttl.as_deref()));
+            ttl = ttl.max(parse_ttl_with_default(cc.ttl.as_deref(), default_ttl_secs));
         }
     };
     if let Some(tools) = req.tools.as_ref() {
@@ -587,12 +1016,140 @@ fn detect_max_ttl(req: &MessagesRequest) -> i64 {
                     .and_then(|cc| cc.get("ttl"))
                     .and_then(|t| t.as_str())
                 {
-                    ttl = ttl.max(parse_ttl(Some(t)));
+                    ttl = ttl.max(parse_ttl_with_default(Some(t), default_ttl_secs));
                 }
             }
         }
     }
     ttl
+}
+
+fn estimate_request_tokens(req: &MessagesRequest) -> u32 {
+    let mut total = 0u32;
+    if let Some(tools) = req.tools.as_ref() {
+        for tool in tools {
+            total = total.saturating_add(estimate_tokens(&tool_token_text(tool)).max(0) as u32);
+        }
+    }
+    if let Some(system) = req.system.as_ref() {
+        for item in system {
+            total = total.saturating_add(estimate_tokens(&item.text).max(0) as u32);
+        }
+    }
+    for msg in &req.messages {
+        match &msg.content {
+            serde_json::Value::String(s) => {
+                total = total.saturating_add(estimate_tokens(s).max(0) as u32);
+            }
+            serde_json::Value::Array(arr) => {
+                for v in arr {
+                    if v.get("type").and_then(|t| t.as_str()) == Some("image") {
+                        let (media_type, data) = image_source_parts(v);
+                        total = total.saturating_add(crate::image_resize::estimate_image_tokens(media_type, data));
+                    } else {
+                        total = total.saturating_add(estimate_tokens(&block_token_text(v)).max(0) as u32);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+fn remove_from_session_index(
+    index: &mut HashMap<String, HashSet<u64>>,
+    session_seed: &str,
+    hash: u64,
+) {
+    if let Some(set) = index.get_mut(session_seed) {
+        set.remove(&hash);
+        if set.is_empty() {
+            index.remove(session_seed);
+        }
+    }
+}
+
+fn remove_entry(inner: &mut Inner, hash: u64) -> Option<CacheEntry> {
+    let removed = inner.entries.remove(&hash)?;
+    remove_from_session_index(&mut inner.session_index, &removed.session_seed, hash);
+    Some(removed)
+}
+
+fn enforce_session_limit(inner: &mut Inner, session_seed: &str, max_session_entries: usize) {
+    if max_session_entries == 0 {
+        return;
+    }
+    loop {
+        let Some(set) = inner.session_index.get(session_seed) else {
+            break;
+        };
+        if set.len() <= max_session_entries {
+            break;
+        }
+        let victim = set
+            .iter()
+            .filter_map(|hash| inner.entries.get(hash).map(|entry| (*hash, entry.last_hit_at)))
+            .min_by_key(|(_, last_hit)| *last_hit)
+            .map(|(hash, _)| hash);
+        let Some(hash) = victim else { break };
+        if remove_entry(inner, hash).is_some() {
+            inner.counters.evicted_session_limit =
+                inner.counters.evicted_session_limit.saturating_add(1);
+            inner.dirty = true;
+        } else {
+            break;
+        }
+    }
+}
+
+fn enforce_global_capacity(inner: &mut Inner, config: &CacheMeteringConfig) {
+    let max_entries = config.max_entries.max(1);
+    if inner.entries.len() <= max_entries {
+        return;
+    }
+    if config.evict_expired_first {
+        let now = now_secs();
+        let expired: Vec<u64> = inner
+            .entries
+            .iter()
+            .filter_map(|(hash, entry)| (entry.expires_at <= now).then_some(*hash))
+            .collect();
+        for hash in expired {
+            if inner.entries.len() <= max_entries {
+                break;
+            }
+            if remove_entry(inner, hash).is_some() {
+                inner.counters.evicted_expired =
+                    inner.counters.evicted_expired.saturating_add(1);
+            }
+        }
+    }
+    if inner.entries.len() <= max_entries {
+        return;
+    }
+    let drop_n = inner.entries.len() - max_entries;
+    let mut victims: Vec<(u64, i64)> = inner
+        .entries
+        .iter()
+        .map(|(hash, entry)| (*hash, entry.last_hit_at))
+        .collect();
+    victims.sort_by_key(|x| x.1);
+    for (hash, _) in victims.into_iter().take(drop_n) {
+        if remove_entry(inner, hash).is_some() {
+            inner.counters.evicted_lru = inner.counters.evicted_lru.saturating_add(1);
+        }
+    }
+}
+
+fn cleanup_inflight(inner: &mut Inner, now: i64) {
+    inner.inflight.retain(|_, entry| entry.expires_at > now);
+}
+
+fn session_fingerprint(seed: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(seed.as_bytes());
+    hex::encode(&digest[..4])
 }
 
 fn tool_signature(t: &Tool) -> String {
@@ -664,7 +1221,7 @@ mod tests {
         let r1 = cache.lookup(&hashes, &tokens);
         assert!(r1.iter().all(|s| !s.hit));
 
-        cache.record(&hashes, &tokens, 300);
+        cache.record("key:test", &hashes, &tokens, 300);
         let r2 = cache.lookup(&hashes, &tokens);
         assert!(r2.iter().all(|s| s.hit));
     }
@@ -672,7 +1229,7 @@ mod tests {
     #[test]
     fn ttl_expiry_makes_entry_miss() {
         let cache = CacheMeter::new(None);
-        cache.record(&[42], &[100], 60);
+        cache.record("key:test", &[42], &[100], 60);
         // 手动让条目过期
         {
             let mut inner = cache.inner.lock();
@@ -687,7 +1244,7 @@ mod tests {
     #[test]
     fn evict_expired_removes_dead_entries() {
         let cache = CacheMeter::new(None);
-        cache.record(&[1, 2], &[5, 5], 60);
+        cache.record("key:test", &[1, 2], &[5, 5], 60);
         {
             let mut inner = cache.inner.lock();
             for (_, v) in inner.entries.iter_mut() {
@@ -710,7 +1267,7 @@ mod tests {
     fn flush_and_reload_round_trip() {
         let tmp = std::env::temp_dir().join(format!("kiro-pc-{}.json", now_secs()));
         let cache = CacheMeter::new(Some(tmp.clone()));
-        cache.record(&[7], &[42], 600);
+        cache.record("key:test", &[7], &[42], 600);
         cache.flush_to_disk();
 
         let cache2 = CacheMeter::new(Some(tmp.clone()));
@@ -1202,22 +1759,129 @@ mod tests {
         };
         let cache = CacheMeter::new(None);
         // 同 key_id（都为 0），仅 session 不同——靠 metadata session 隔离。
-        let s1a = compute_cache_usage(&cache, &make("aaa"), 0);
+        let sid_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let sid_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let s1a = compute_cache_usage(&cache, &make(sid_a), 0);
         assert_eq!(s1a.cache_read, 0);
-        let s2 = compute_cache_usage(&cache, &make("bbb"), 0);
+        let s2 = compute_cache_usage(&cache, &make(sid_b), 0);
         assert_eq!(s2.cache_read, 0, "不同 session 不应命中");
-        let s1b = compute_cache_usage(&cache, &make("aaa"), 0);
+        let s1b = compute_cache_usage(&cache, &make(sid_a), 0);
         assert!(s1b.cache_read > 0, "相同 session 应命中");
+    }
+
+    #[test]
+    fn json_metadata_session_scopes_cache() {
+        use super::super::types::{Message, MessagesRequest, Metadata};
+        let body = "json metadata session prefix ".repeat(25);
+        let make = |session: &str| MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: Some(serde_json::json!({
+                    "device_id": "dev",
+                    "account_uuid": "acct",
+                    "session_id": session
+                }).to_string()),
+            }),
+        };
+        let cache = CacheMeter::new(None);
+        let sid_a = "11111111-1111-4111-8111-111111111111";
+        let sid_b = "22222222-2222-4222-8222-222222222222";
+        let a1 = compute_cache_usage(&cache, &make(sid_a), 7);
+        assert_eq!(a1.cache_read, 0);
+        let b1 = compute_cache_usage(&cache, &make(sid_b), 7);
+        assert_eq!(b1.cache_read, 0, "不同 JSON session 不应互相命中");
+        let a2 = compute_cache_usage(&cache, &make(sid_a), 7);
+        assert!(a2.cache_read > 0, "相同 JSON session 应命中");
+        let stats = cache.stats();
+        assert!(stats.counters.seed_metadata_json >= 3);
+        assert_eq!(stats.counters.seed_key_id, 0);
+    }
+
+    #[test]
+    fn max_entries_is_configurable() {
+        use crate::model::config::CacheMeteringConfig;
+        use super::super::types::{Message, MessagesRequest};
+
+        let config = CacheMeteringConfig {
+            max_entries: 2,
+            ..CacheMeteringConfig::default()
+        };
+        let cache = CacheMeter::with_config(
+            None,
+            std::sync::Arc::new(parking_lot::RwLock::new(config)),
+        );
+        let make = |suffix: &str| MessagesRequest {
+            model: "m".to_string(),
+            max_tokens: 8,
+            messages: vec![
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([{"type":"text","text":format!("{} {}", "body ".repeat(30), suffix)}]),
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: serde_json::json!([{"type":"text","text":format!("{} {}", "answer ".repeat(30), suffix)}]),
+                },
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!("next"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        compute_cache_usage(&cache, &make("a"), 1);
+        compute_cache_usage(&cache, &make("b"), 1);
+        compute_cache_usage(&cache, &make("c"), 1);
+        assert!(cache.len() <= 2);
+        assert!(cache.stats().counters.evicted_lru > 0);
     }
 
     #[test]
     fn extract_session_id_parses_claude_code_format() {
         assert_eq!(
-            extract_session_id("user_xxx_account__session_0b4445e1-uuid"),
-            Some("0b4445e1-uuid".to_string())
+            extract_session_id("user_xxx_account__session_0b4445e1-1111-4111-8111-111111111111"),
+            Some("0b4445e1-1111-4111-8111-111111111111".to_string())
         );
         assert_eq!(extract_session_id("no-session-here"), None);
         assert_eq!(extract_session_id("trailing_session_"), None);
+    }
+
+    #[test]
+    fn extract_session_id_parses_json_format() {
+        assert_eq!(
+            extract_session_id(
+                r#"{"device_id":"dev","account_uuid":"acct","session_id":"33333333-3333-4333-8333-333333333333"}"#
+            ),
+            Some("33333333-3333-4333-8333-333333333333".to_string())
+        );
     }
 
     /// token 口径纯净性：cum_tokens 只算原文，不含 role / 签名前缀 / 分隔符噪声。

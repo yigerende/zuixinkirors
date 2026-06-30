@@ -35,6 +35,8 @@ import type {
   UpdateCheckInfo,
   GitHubRateLimitInfo,
   UpdateAdminKeyRequest,
+  CacheMeteringConfig,
+  CacheMeteringResponse,
   CacheOptimizerConfig,
 } from '@/types/api'
 
@@ -70,6 +72,26 @@ export async function getCacheOptimizer(): Promise<CacheOptimizerConfig> {
 export async function setCacheOptimizer(config: CacheOptimizerConfig): Promise<CacheOptimizerConfig> {
   const { data } = await api.put<{ config: CacheOptimizerConfig }>('/cache-optimizer', config)
   return data.config
+}
+
+export async function getCacheMetering(): Promise<CacheMeteringResponse> {
+  const { data } = await api.get<CacheMeteringResponse>('/cache-metering')
+  return data
+}
+
+export async function setCacheMetering(config: CacheMeteringConfig): Promise<CacheMeteringResponse> {
+  const { data } = await api.put<CacheMeteringResponse>('/cache-metering', config)
+  return data
+}
+
+export async function clearCacheMetering(): Promise<{ removed: number }> {
+  const { data } = await api.post<{ removed: number }>('/cache-metering/clear')
+  return data
+}
+
+export async function clearCacheMeteringExpired(): Promise<{ removed: number }> {
+  const { data } = await api.post<{ removed: number }>('/cache-metering/clear-expired')
+  return data
 }
 
 // ============ KAM 导出 ============

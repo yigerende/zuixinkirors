@@ -47,6 +47,70 @@ export interface CacheOptimizerConfig {
   inputScaleSegments: InputScaleSegment[]
 }
 
+export interface CacheMeteringSessionConfig {
+  enableJsonMetadata: boolean
+  enableLegacyMetadata: boolean
+  fallbackToKeyId: boolean
+  strictUuid: boolean
+}
+
+export interface CacheMeteringSingleflightConfig {
+  enabled: boolean
+  waitMs: number
+  inflightTtlSeconds: number
+  maxInflight: number
+}
+
+export interface CacheMeteringDebugConfig {
+  sampleRate: number
+  logMissReason: boolean
+  logSeedSource: boolean
+  logPrefixStats: boolean
+}
+
+export interface CacheMeteringConfig {
+  enabled: boolean
+  maxEntries: number
+  defaultTtlSeconds: number
+  maxSessionEntries: number
+  persistEnabled: boolean
+  persistIntervalSeconds: number
+  cleanupIntervalSeconds: number
+  evictExpiredFirst: boolean
+  session: CacheMeteringSessionConfig
+  singleflight: CacheMeteringSingleflightConfig
+  debug: CacheMeteringDebugConfig
+}
+
+export interface CacheMeteringRuntime {
+  entriesTotal: number
+  sessionsTotal: number
+  inflightTotal: number
+  persistPath?: string | null
+}
+
+export interface CacheMeteringStatsCounters {
+  sessionParseOk: number
+  sessionParseFailed: number
+  seedMetadataJson: number
+  seedMetadataLegacy: number
+  seedKeyId: number
+  lookupHit: number
+  lookupMiss: number
+  evictedLru: number
+  evictedExpired: number
+  evictedSessionLimit: number
+  inflightWait: number
+  inflightHitAfterWait: number
+  inflightTimeout: number
+}
+
+export interface CacheMeteringResponse {
+  config: CacheMeteringConfig
+  runtime: CacheMeteringRuntime | null
+  stats: CacheMeteringStatsCounters | null
+}
+
 export interface CredentialsStatusResponse {
   total: number
   available: number

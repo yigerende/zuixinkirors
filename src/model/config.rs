@@ -206,6 +206,159 @@ impl Default for CacheOptimizerConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheMeteringSessionConfig {
+    #[serde(default = "default_true")]
+    pub enable_json_metadata: bool,
+    #[serde(default = "default_true")]
+    pub enable_legacy_metadata: bool,
+    #[serde(default = "default_true")]
+    pub fallback_to_key_id: bool,
+    #[serde(default = "default_true")]
+    pub strict_uuid: bool,
+}
+
+impl Default for CacheMeteringSessionConfig {
+    fn default() -> Self {
+        Self {
+            enable_json_metadata: true,
+            enable_legacy_metadata: true,
+            fallback_to_key_id: true,
+            strict_uuid: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheMeteringSingleflightConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_cache_metering_wait_ms")]
+    pub wait_ms: u64,
+    #[serde(default = "default_cache_metering_inflight_ttl_seconds")]
+    pub inflight_ttl_seconds: i64,
+    #[serde(default = "default_cache_metering_max_inflight")]
+    pub max_inflight: usize,
+}
+
+impl Default for CacheMeteringSingleflightConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            wait_ms: default_cache_metering_wait_ms(),
+            inflight_ttl_seconds: default_cache_metering_inflight_ttl_seconds(),
+            max_inflight: default_cache_metering_max_inflight(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheMeteringDebugConfig {
+    #[serde(default = "default_cache_metering_sample_rate")]
+    pub sample_rate: f64,
+    #[serde(default = "default_true")]
+    pub log_miss_reason: bool,
+    #[serde(default = "default_true")]
+    pub log_seed_source: bool,
+    #[serde(default = "default_true")]
+    pub log_prefix_stats: bool,
+}
+
+impl Default for CacheMeteringDebugConfig {
+    fn default() -> Self {
+        Self {
+            sample_rate: default_cache_metering_sample_rate(),
+            log_miss_reason: true,
+            log_seed_source: true,
+            log_prefix_stats: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheMeteringConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_cache_metering_max_entries")]
+    pub max_entries: usize,
+    #[serde(default = "default_cache_metering_default_ttl_seconds")]
+    pub default_ttl_seconds: i64,
+    #[serde(default = "default_cache_metering_max_session_entries")]
+    pub max_session_entries: usize,
+    #[serde(default = "default_true")]
+    pub persist_enabled: bool,
+    #[serde(default = "default_cache_metering_persist_interval_seconds")]
+    pub persist_interval_seconds: u64,
+    #[serde(default = "default_cache_metering_cleanup_interval_seconds")]
+    pub cleanup_interval_seconds: u64,
+    #[serde(default = "default_true")]
+    pub evict_expired_first: bool,
+    #[serde(default)]
+    pub session: CacheMeteringSessionConfig,
+    #[serde(default)]
+    pub singleflight: CacheMeteringSingleflightConfig,
+    #[serde(default)]
+    pub debug: CacheMeteringDebugConfig,
+}
+
+impl Default for CacheMeteringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_entries: default_cache_metering_max_entries(),
+            default_ttl_seconds: default_cache_metering_default_ttl_seconds(),
+            max_session_entries: default_cache_metering_max_session_entries(),
+            persist_enabled: true,
+            persist_interval_seconds: default_cache_metering_persist_interval_seconds(),
+            cleanup_interval_seconds: default_cache_metering_cleanup_interval_seconds(),
+            evict_expired_first: true,
+            session: CacheMeteringSessionConfig::default(),
+            singleflight: CacheMeteringSingleflightConfig::default(),
+            debug: CacheMeteringDebugConfig::default(),
+        }
+    }
+}
+
+fn default_cache_metering_max_entries() -> usize {
+    200_000
+}
+
+fn default_cache_metering_default_ttl_seconds() -> i64 {
+    5 * 60
+}
+
+fn default_cache_metering_max_session_entries() -> usize {
+    2048
+}
+
+fn default_cache_metering_persist_interval_seconds() -> u64 {
+    60
+}
+
+fn default_cache_metering_cleanup_interval_seconds() -> u64 {
+    30
+}
+
+fn default_cache_metering_wait_ms() -> u64 {
+    50
+}
+
+fn default_cache_metering_inflight_ttl_seconds() -> i64 {
+    10
+}
+
+fn default_cache_metering_max_inflight() -> usize {
+    10_000
+}
+
+fn default_cache_metering_sample_rate() -> f64 {
+    0.01
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -354,6 +507,10 @@ pub struct Config {
     #[serde(default)]
     pub cache_optimizer: CacheOptimizerConfig,
 
+    /// 真实缓存计量配置；只影响 `cache_metering.rs` 本地真实缓存推导。
+    #[serde(default)]
+    pub cache_metering: CacheMeteringConfig,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -474,6 +631,7 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             cache_optimizer: CacheOptimizerConfig::default(),
+            cache_metering: CacheMeteringConfig::default(),
             endpoints: HashMap::new(),
             config_path: None,
         }

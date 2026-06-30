@@ -337,31 +337,7 @@ impl std::error::Error for ConversionError {}
 ///
 /// 提取 session UUID 作为 conversationId
 fn extract_session_id(user_id: &str) -> Option<String> {
-    // 先尝试 JSON 解析
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
-        if let Some(session_id) = json.get("session_id").and_then(|v| v.as_str()) {
-            if is_valid_uuid(session_id) {
-                return Some(session_id.to_string());
-            }
-        }
-    }
-
-    // 回退到字符串格式: 查找 "session_" 后面的内容
-    if let Some(pos) = user_id.find("session_") {
-        let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
-        if session_part.len() >= 36 {
-            let uuid_str = &session_part[..36];
-            if is_valid_uuid(uuid_str) {
-                return Some(uuid_str.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// 简单验证 UUID 格式（36 字符，包含 4 个连字符）
-fn is_valid_uuid(s: &str) -> bool {
-    s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
+    super::cache_metering::extract_session_id(user_id)
 }
 
 /// 收集历史消息中使用的所有工具名称

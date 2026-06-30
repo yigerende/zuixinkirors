@@ -26,7 +26,7 @@ use super::{
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
-use crate::model::config::CacheOptimizerConfig;
+use crate::model::config::{CacheMeteringConfig, CacheOptimizerConfig};
 
 // Path 元组提取：(credential_id, session_id)
 type CredSessionPath = (u64, String);
@@ -51,6 +51,68 @@ pub async fn set_cache_optimizer(
 ) -> impl IntoResponse {
     match state.service.set_cache_optimizer(payload) {
         Ok(config) => Json(serde_json::json!({ "config": config })).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/cache-metering
+pub async fn get_cache_metering(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_cache_metering())
+}
+
+/// PUT /api/admin/cache-metering
+pub async fn set_cache_metering(
+    State(state): State<AdminState>,
+    Json(payload): Json<CacheMeteringConfig>,
+) -> impl IntoResponse {
+    match state.service.set_cache_metering(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/cache-metering/stats
+pub async fn get_cache_metering_stats(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_cache_metering())
+}
+
+/// POST /api/admin/cache-metering/clear
+pub async fn clear_cache_metering(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.clear_cache_metering_all() {
+        Ok(removed) => Json(serde_json::json!({ "removed": removed })).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/cache-metering/clear-expired
+pub async fn clear_cache_metering_expired(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.clear_cache_metering_expired() {
+        Ok(removed) => Json(serde_json::json!({ "removed": removed })).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/cache-metering/clear-session
+pub async fn clear_cache_metering_session(
+    State(state): State<AdminState>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let session = payload
+        .get("session")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if session.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "session 不能为空".to_string(),
+            )),
+        )
+            .into_response();
+    }
+    match state.service.clear_cache_metering_session(session) {
+        Ok(removed) => Json(serde_json::json!({ "removed": removed })).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
