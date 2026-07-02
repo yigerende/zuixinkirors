@@ -493,6 +493,15 @@ fn cache_optimizer_controls_response(
 fn available_models() -> Vec<Model> {
     vec![
         Model {
+            id: "claude-sonnet-5".to_string(),
+            object: "model".to_string(),
+            created: 1782979200, // Jul 2, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
             id: "claude-opus-4-8".to_string(),
             object: "model".to_string(),
             created: 1779897600, // May 28, 2026
@@ -2200,5 +2209,13 @@ mod tests {
         assert!(ids.contains(&"claude-opus-4-8-thinking"));
         assert!(ids.contains(&"claude-sonnet-4-8"));
         assert!(ids.contains(&"claude-sonnet-4-8-thinking"));
+    }
+
+    #[test]
+    fn available_models_include_sonnet_5() {
+        let models = available_models();
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+
+        assert!(ids.contains(&"claude-sonnet-5"));
     }
 }
